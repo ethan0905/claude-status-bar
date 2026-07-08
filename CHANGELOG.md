@@ -3,6 +3,21 @@
 All notable changes to Claude Status Bar are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-07-09
+
+### Added
+- Dynamic Island UI at the notch: an expandable panel with a focused hero card (session name, live timer, status · path, tool chip, working shimmer), a single-line session list, and an inline settings page (icon style, accent, toggles, hide-idle).
+- Split collapsed layout: the activity icon + label sit to the left of the camera and the elapsed timer to the right, hugging the notch instead of dropping below it — much shorter.
+- Sessions include their project path (`project_path` in the hook state) for the hero card's status line.
+
+### Changed
+- Panel background is pure black to fuse with the physical notch; square top corners, rounded bottom.
+- Idle collapses to the bare notch (no icon or label).
+- On external monitors the synthetic pill hides while idle and only appears when there's something to show.
+
+### Fixed
+- Settings switches toggled twice (mouse-up bubbling to the row) — clicking a switch now flips it once.
+
 ## [0.3.2] - 2026-07-02
 
 ### Added
