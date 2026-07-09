@@ -10,6 +10,37 @@ const dir = path.join(os.homedir(), ".claude", "statusbar");
 const stateDir = path.join(dir, "state.d");
 const event = process.argv[2] || "";
 
+// Controlling tty of this session, for exact terminal-tab focus and permission keystroke delivery
+// (the app matches a Terminal/iTerm tab — or a tmux pane — by tty). Two strategies:
+//   1. Inside tmux ($TMUX_PANE set): ask tmux for the pane's tty directly. This is authoritative and
+//      works even when the claude process itself has no controlling tty (e.g. inside VS Code's
+//      integrated terminal, where the `ps` walk below returns "??").
+//   2. Otherwise: walk up the process tree to the first real ttysNNN (stdio may be piped).
+// "" = no tty (e.g. the desktop app). Stable per session, so callers carry it over.
+function ttyDev() {
+  const { execSync } = require("child_process");
+  // 1. tmux pane tty (most reliable inside tmux, incl. VS Code integrated terminal).
+  const pane = process.env.TMUX_PANE;
+  if (pane) {
+    for (const tmux of ["tmux", "/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]) {
+      try {
+        const dev = execSync(`${tmux} display-message -p -t '${pane}' '#{pane_tty}'`, { encoding: "utf8" }).trim();
+        if (dev.startsWith("/dev/tty")) return dev;
+      } catch {}
+    }
+  }
+  // 2. process-tree walk.
+  try {
+    let pid = String(process.pid);
+    for (let i = 0; i < 6 && pid && pid !== "1"; i++) {
+      const [tty, ppid] = execSync(`ps -o tty=,ppid= -p ${pid}`, { encoding: "utf8" }).trim().split(/\s+/);
+      if (tty && tty.startsWith("tty")) return "/dev/" + tty;
+      pid = ppid;
+    }
+  } catch {}
+  return "";
+}
+
 const TOOL_LABELS = {
   Bash: "Running command", Edit: "Editing", Write: "Writing", MultiEdit: "Editing",
   NotebookEdit: "Editing", Read: "Reading", Grep: "Searching", Glob: "Searching",
@@ -86,11 +117,18 @@ process.stdin.on("end", () => {
   // TERM_PROGRAM identifies the terminal app for a CLI session (Apple_Terminal, iTerm.app,
   // vscode, WezTerm, …); the app uses it to bring that terminal to the front on a row click.
   const termProgram = process.env.TERM_PROGRAM || prev.term_program || "";
+  // tty: the session's controlling terminal. Drives exact terminal-tab focus and permission
+  // keystroke delivery (tmux send-keys / iTerm AppleScript). Recompute when empty so a session that
+  // seeded before tmux was known still gets one; a good value is carried over to avoid re-running ps.
+  const tty = prev.tty || ttyDev();
+  // TMUX env (present when claude runs inside tmux) tells the app to route keystrokes through
+  // `tmux send-keys` to the pane owning this tty, instead of the terminal app directly.
+  const insideTmux = !!process.env.TMUX || !!prev.tmux;
   // process.ppid IS this session's `claude` process (verified: hooks are spawned directly by it,
   // stable for the session's life, on both CLI and desktop). The app uses kill(pid,0) for liveness.
   // started:true — any update.js event (prompt/tool/permission/stop) is real activity, so the session
   // graduates from "merely opened" to visible in the dropdown. Clicking a conversation never fires here.
-  const out = { state, label, tool: p.tool_name || "", project, project_path: projectPath, sessionId: p.session_id || "", transcript: p.transcript_path || prev.transcript || "", entrypoint, term_program: termProgram, pid: process.ppid, started: true, startedAt, ts };
+  const out = { state, label, tool: p.tool_name || "", project, project_path: projectPath, sessionId: p.session_id || "", transcript: p.transcript_path || prev.transcript || "", entrypoint, term_program: termProgram, pid: process.ppid, started: true, tty, tmux: insideTmux, startedAt, ts };
   try {
     fs.mkdirSync(stateDir, { recursive: true });
     const tmp = statePath + "." + process.pid + ".tmp";

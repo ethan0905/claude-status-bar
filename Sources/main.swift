@@ -1,4 +1,5 @@
 import Cocoa
+import ApplicationServices  // AXIsProcessTrustedWithOptions (Accessibility check for keystroke posting)
 
 // Custom-drawn toggle. NSSwitch can't show its accent inside a menu (the menu's vibrant, non-key
 // window draws the implicit accent gray), so we render the track + knob as layers and fill the
@@ -217,6 +218,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         var tool: String        // raw tool name from the hook (Bash, Edit, …); "" outside tool/permission
         var entrypoint: String  // CLAUDE_CODE_ENTRYPOINT: "cli", "claude-desktop", …
         var termProgram: String // TERM_PROGRAM for CLI sessions: "Apple_Terminal", "iTerm.app", …
+        var tty: String         // controlling tty (e.g. /dev/ttys003) for exact focus + permission keystroke
+        var tmux: Bool          // session runs inside tmux → keystrokes route via `tmux send-keys`
         var pid: Int32          // the session's `claude` process; kill(pid,0) drives liveness. 0 = pre-upgrade file.
         var started: Bool       // true once the session had real activity (a prompt/tool); a merely-opened
                                 // conversation seeds started=false and stays out of the dropdown.
@@ -233,6 +236,8 @@ final class StatusController: NSObject, NSMenuDelegate {
             self.tool = o["tool"] as? String ?? ""
             self.entrypoint = o["entrypoint"] as? String ?? ""
             self.termProgram = o["term_program"] as? String ?? ""
+            self.tty = o["tty"] as? String ?? ""
+            self.tmux = o["tmux"] as? Bool ?? false
             self.pid = Int32(truncatingIfNeeded: (o["pid"] as? NSNumber)?.intValue ?? 0)
             self.started = o["started"] as? Bool ?? false
             self.startedAt = (o["startedAt"] as? NSNumber)?.doubleValue ?? 0
@@ -263,6 +268,7 @@ final class StatusController: NSObject, NSMenuDelegate {
     var playCompletionSound = false // chime when a turn longer than ~5 min finishes
     var useThinkingWords = true     // rotate a playful verb ("Manifesting…") in place of "Thinking…"
     var showAtNotch = true          // on a notched Mac, render at the notch and hide the menu bar item
+    var exactTerminalFocus = false  // experimental: iTerm exact-tab focus + Allow/Deny keystroke (AppleScript, one-time macOS Automation grant). tmux keystrokes need no grant and work regardless.
     var sessionWord: [String: String] = [:] // id -> current thinking word; re-picked on each entry into "thinking"
 
     // Notch overlay. Present only on a notched Mac with "Show at notch" on; nil => the menu bar item
@@ -361,6 +367,7 @@ final class StatusController: NSObject, NSMenuDelegate {
         if d.object(forKey: "completionSound") != nil { playCompletionSound = d.bool(forKey: "completionSound") }
         if d.object(forKey: "thinkingWords") != nil { useThinkingWords = d.bool(forKey: "thinkingWords") }
         if d.object(forKey: "showAtNotch") != nil { showAtNotch = d.bool(forKey: "showAtNotch") }
+        if d.object(forKey: "exactTerminalFocus") != nil { exactTerminalFocus = d.bool(forKey: "exactTerminalFocus") }
         if let s = d.string(forKey: "animStyle"), let st = AnimStyle(rawValue: s) { animStyle = st }
         statusMenu.delegate = self
         setupNotch()   // builds the notch window (and hides the status item) when a notch is present
@@ -749,6 +756,9 @@ final class StatusController: NSObject, NSMenuDelegate {
         let toolText = lead?.tool ?? ""
         let hasChip = (eff == "tool" || eff == "permission") && !toolText.isEmpty
         let hasJump = lead != nil
+        // Allow/Deny keystroke row: only when a permission is waiting AND we can reliably target the
+        // session's prompt (tmux pane, or iTerm with the grant on). Otherwise the buttons are hidden.
+        let hasPermActions = eff == "permission" && (lead.map(canSendPermissionKey) ?? false)
 
         let accent: NSColor = eff == "permission" ? amber
                             : doneNow ? islandGreen
@@ -760,8 +770,9 @@ final class StatusController: NSObject, NSMenuDelegate {
         let pad: CGFloat = 12, topRow: CGFloat = 34
         let progBlk: CGFloat = hasProgress ? 11 + 3 : 0
         let chipBlk: CGFloat = hasChip ? 11 + 30 : 0
+        let permBlk: CGFloat = hasPermActions ? 10 + 32 : 0   // Allow/Deny button row
         let jumpBlk: CGFloat = hasJump ? 9 + 16 : 0
-        let h = pad + topRow + progBlk + chipBlk + jumpBlk + pad
+        let h = pad + topRow + progBlk + chipBlk + permBlk + jumpBlk + pad
         let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: h))
         card.wantsLayer = true
         card.layer?.backgroundColor = accent.withAlphaComponent(0.11).cgColor  // accent-soft wash (design)
@@ -888,6 +899,26 @@ final class StatusController: NSObject, NSMenuDelegate {
             y -= 30
         }
 
+        // ── Allow / Deny keystroke buttons (permission only, when we can target the prompt) ──
+        if hasPermActions, let lead = lead {
+            y -= 10
+            let rowH: CGFloat = 32
+            let gap: CGFloat = 8
+            let btnW = (width - 2 * pad - gap) / 2
+            let denyBtn = islandPermButton("Deny", filled: false, accent: NSColor(srgbRed: 0.86, green: 0.35, blue: 0.32, alpha: 1),
+                                           frame: NSRect(x: pad, y: y - rowH, width: btnW, height: rowH)) { [weak self] in
+                self?.answerPermission(lead, .deny)
+            }
+            let allowBtn = islandPermButton("Allow", filled: true, accent: islandGreen,
+                                            frame: NSRect(x: pad + btnW + gap, y: y - rowH, width: btnW, height: rowH)) { [weak self] in
+                self?.answerPermission(lead, .allow)
+            }
+            denyBtn.autoresizingMask = [.width]
+            allowBtn.autoresizingMask = [.width, .minXMargin]
+            card.addSubview(denyBtn); card.addSubview(allowBtn)
+            y -= rowH
+        }
+
         // ── jump to session (subtle right-aligned text link, design) ───────────────
         if let lead = lead {
             y -= 9
@@ -908,11 +939,51 @@ final class StatusController: NSObject, NSMenuDelegate {
             arrow.contentTintColor = linkColor
             arrow.imageScaling = .scaleProportionallyUpOrDown
             jump.addSubview(arrow)
-            let sid = lead.id, ep = lead.entrypoint, tp = lead.termProgram
-            jump.onClick = { [weak self] in self?.collapseNotch(); self?.openSession(sid, entrypoint: ep, termProgram: tp) }
+            let sid = lead.id, ep = lead.entrypoint, tp = lead.termProgram, tt = lead.tty, tx = lead.tmux
+            jump.onClick = { [weak self] in self?.collapseNotch(); self?.openSession(sid, entrypoint: ep, termProgram: tp, tty: tt, tmux: tx) }
             card.addSubview(jump)
         }
         return card
+    }
+
+    // A permission Allow/Deny button: a filled accent pill (Allow) or an outlined one (Deny), with a
+    // centered label. Reuses IslandRow for the hover highlight + click.
+    func islandPermButton(_ title: String, filled: Bool, accent: NSColor, frame: NSRect, action: @escaping () -> Void) -> IslandRow {
+        let btn = IslandRow(height: frame.height)
+        btn.frame = frame
+        btn.wantsLayer = true
+        btn.layer?.cornerRadius = 9
+        btn.layer?.borderWidth = 1
+        if filled {
+            btn.layer?.backgroundColor = accent.withAlphaComponent(0.22).cgColor
+            btn.layer?.borderColor = accent.withAlphaComponent(0.55).cgColor
+        } else {
+            btn.layer?.backgroundColor = NSColor(white: 1, alpha: 0.04).cgColor
+            btn.layer?.borderColor = accent.withAlphaComponent(0.45).cgColor
+        }
+        let labelColor = filled ? accent.blended(withFraction: 0.35, of: .white) ?? accent : accent
+        let lbl = islandLabel(title, size: 12.5, weight: .semibold, color: labelColor)
+        lbl.alignment = .center
+        lbl.frame = NSRect(x: 0, y: (frame.height - 15) / 2, width: frame.width, height: 15)
+        lbl.autoresizingMask = [.width]
+        btn.addSubview(lbl)
+        btn.onClick = action
+        return btn
+    }
+
+    // Answer the waiting permission by delivering the keystroke, then collapse the notch so focus
+    // returns to the session. Guarded by canSendPermissionKey (buttons only render when we can send).
+    func answerPermission(_ s: Session, _ answer: PermAnswer) {
+        switch sendPermissionKey(s, answer) {
+        case .sent:
+            collapseNotch()          // let the user see the result in their terminal
+        case .denied:
+            handleGrantDenied()      // iTerm Automation grant declined → turn the toggle off
+            collapseNotch()
+        case .unsupported:
+            // Shouldn't happen (buttons gated by canSendPermissionKey), but fall back to focusing.
+            openSession(s.id, entrypoint: s.entrypoint, termProgram: s.termProgram, tty: s.tty, tmux: s.tmux)
+        }
     }
 
     // Compact settings (new design): a grouped "Icon style / Accent" card, a grouped toggles card,
@@ -1184,8 +1255,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         line.autoresizingMask = [.width]
         row.addSubview(line)
 
-        let sid = s.id, ep = s.entrypoint, tp = s.termProgram
-        row.onClick = { [weak self] in self?.collapseNotch(); self?.openSession(sid, entrypoint: ep, termProgram: tp) }
+        let sid = s.id, ep = s.entrypoint, tp = s.termProgram, tt = s.tty, tx = s.tmux
+        row.onClick = { [weak self] in self?.collapseNotch(); self?.openSession(sid, entrypoint: ep, termProgram: tp, tty: tt, tmux: tx) }
         return row
     }
 
@@ -1388,8 +1459,8 @@ final class StatusController: NSObject, NSMenuDelegate {
             for s in visible {
                 let eff = s.eff.isEmpty ? effectiveState(s, now: now) : s.eff
                 let view = SessionRowView(id: s.id, width: CGFloat(uiConfig()["boxWidth"] ?? 300))
-                let sid = s.id, ep = s.entrypoint, tp = s.termProgram
-                view.onClick = { [weak self] in menu.cancelTracking(); self?.openSession(sid, entrypoint: ep, termProgram: tp) }
+                let sid = s.id, ep = s.entrypoint, tp = s.termProgram, tt = s.tty, tx = s.tmux
+                view.onClick = { [weak self] in menu.cancelTracking(); self?.openSession(sid, entrypoint: ep, termProgram: tp, tty: tt, tmux: tx) }
                 configureSessionRow(view, s, eff: eff)
                 let it = NSMenuItem()
                 it.view = view
@@ -1428,6 +1499,11 @@ final class StatusController: NSObject, NSMenuDelegate {
                 self?.setupNotch()   // build or tear down the notch window; flips the status item
             })
         }
+        // Experimental: iTerm exact-tab focus + Allow/Deny keystroke on permission prompts (one-time
+        // Automation grant). tmux Allow/Deny works without this toggle (no grant needed).
+        menu.addItem(toggleRow(title: "Exact terminal focus", qualifier: "experimental", isOn: exactTerminalFocus) { [weak self] on in
+            self?.setExactTerminalFocus(on)
+        })
 
         // One "Settings" fly-out holding every set-once picker, grouped by section headers, so the
         // main menu stays focused on the live sessions + quick toggles instead of three separate submenus.
@@ -1729,24 +1805,265 @@ final class StatusController: NSObject, NSMenuDelegate {
     // (local_<random>.json with cliSessionId=<id>) every click, it's an import verb, not focus.
     // The clean focus path (claude://code/<bridgeSessionId>) needs an opaque session_/cse_ bridge
     // id the app never exposes to us (not in env, not derivable from the UUID, undefined on disk).
-    // CLI session: bring its terminal APP to the front (zero permission). Targeting the exact
-    // window/tab needs a one-time Automation grant, deferred to the opt-in build (issue #19).
-    func openSession(_ id: String, entrypoint: String, termProgram: String) {
+    // CLI session: bring its terminal APP to the front (zero permission). Exact window/tab focus
+    // (tmux pane or iTerm tab by tty) is layered on for the permission Allow/Deny buttons below.
+    func openSession(_ id: String, entrypoint: String, termProgram: String, tty: String, tmux: Bool) {
         if entrypoint == "claude-desktop" { openClaude(); return }
-        // Map TERM_PROGRAM to a name `open -a` understands; most terminals match verbatim.
-        let app: String
+        // tmux session: select the pane so the click lands you on the exact prompt. iTerm tab focus
+        // (the pane's host window) is best-effort on top.
+        if tmux, !tty.isEmpty { _ = focusTmuxPane(tty: tty) }
+        bringTerminalAppToFront(termProgram)
+    }
+
+    // Map TERM_PROGRAM to a name `open -a` understands; most terminals match verbatim.
+    func terminalAppName(_ termProgram: String) -> String? {
         switch termProgram {
-        case "Apple_Terminal": app = "Terminal"
-        case "iTerm.app":      app = "iTerm"
-        case "vscode":         app = "Visual Studio Code"
-        case "WarpTerminal":   app = "Warp"
-        case "":               return  // unknown surface, nothing to focus
-        default:               app = termProgram  // Ghostty, WezTerm, Tabby, Hyper, kitty, …
+        case "Apple_Terminal": return "Terminal"
+        case "iTerm.app":      return "iTerm"
+        case "vscode":         return "Visual Studio Code"
+        case "WarpTerminal":   return "Warp"
+        case "":               return nil  // unknown surface
+        default:               return termProgram  // Ghostty, WezTerm, Tabby, Hyper, kitty, …
         }
+    }
+
+    // Bring the terminal app to the front (no permission).
+    func bringTerminalAppToFront(_ termProgram: String) {
+        guard let app = terminalAppName(termProgram) else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         p.arguments = ["-a", app]
         try? p.run()
+    }
+
+    // MARK: permission Allow/Deny keystroke
+    //
+    // A permission prompt sits in the session's own terminal. We answer it by delivering a keystroke
+    // to the exact pane/tab that owns the session's tty — never a blind send. Two backends:
+    //   • tmux   → `tmux send-keys -t <pane>` to the pane whose #{pane_tty} matches (no macOS grant).
+    //   • iTerm  → AppleScript: focus the tab whose tty matches, then System Events keystroke
+    //              (needs the one-time Automation grant, gated behind the experimental toggle).
+    // The dispatcher only fires when a supported backend can target the exact session; anything else
+    // returns .unsupported and the UI hides the buttons, so we never type into the wrong place.
+
+    enum PermAnswer { case allow, deny }
+    enum KeyOutcome { case sent, denied, unsupported }
+
+    // True when we can deliver a keystroke to this session's prompt (drives button visibility).
+    //   • tmux       → exact pane by tty. Always safe, no grant.               (needs tty)
+    //   • iTerm.app  → exact tab by tty via AppleScript.                        (needs tty + grant)
+    //   • vscode     → focus VS Code + BLIND keystroke to the focused terminal. (grant, NO exact
+    //                  targeting — VS Code can't be addressed by tty, so this types into whatever
+    //                  terminal tab is frontmost. Gated behind the toggle so it's opt-in.)
+    func canSendPermissionKey(_ s: Session) -> Bool {
+        guard s.entrypoint != "claude-desktop" else { return false }
+        if s.tmux, !s.tty.isEmpty { return true }                        // tmux: exact, no grant
+        if s.termProgram == "iTerm.app", !s.tty.isEmpty { return exactTerminalFocus }  // iTerm: exact + grant
+        if s.termProgram == "vscode" || s.entrypoint == "claude-vscode" { return exactTerminalFocus } // vscode: blind + grant
+        return false
+    }
+
+    // Debug log for the permission keystroke flow (per the "log the flow" workflow). Always on for
+    // now while we validate; writes to ~/.claude/statusbar/perm.log.
+    func permDbg(_ msg: String) {
+        let line = "\(Date()) \(msg)\n"
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/statusbar/perm.log")
+        if let data = line.data(using: .utf8) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                fh.seekToEndOfFile(); fh.write(data); try? fh.close()
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
+    func sendPermissionKey(_ s: Session, _ answer: PermAnswer) -> KeyOutcome {
+        permDbg("sendPermissionKey answer=\(answer) tmux=\(s.tmux) tty=\(s.tty) term=\(s.termProgram) entry=\(s.entrypoint)")
+        guard s.entrypoint != "claude-desktop" else { permDbg("  -> desktop (.unsupported)"); return .unsupported }
+        if s.tmux, !s.tty.isEmpty { return sendTmuxKey(tty: s.tty, answer: answer) }
+        if s.termProgram == "iTerm.app", !s.tty.isEmpty, exactTerminalFocus {
+            return sendITermKey(tty: s.tty, answer: answer)
+        }
+        if s.termProgram == "vscode" || s.entrypoint == "claude-vscode", exactTerminalFocus {
+            return sendVSCodeKey(answer: answer)
+        }
+        return .unsupported
+    }
+
+    // Is this app trusted for Accessibility (required to post System Events keystrokes)? `prompt:true`
+    // shows the system "grant Accessibility" dialog + adds the app to the list once.
+    func hasAccessibility(prompt: Bool) -> Bool {
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        return AXIsProcessTrustedWithOptions([key: prompt] as CFDictionary)
+    }
+
+    // VS Code integrated terminal: no way to address a specific tab by tty (VS Code exposes no such
+    // AppleScript), so we bring VS Code to the front and BLIND-send the key to whatever terminal is
+    // focused. Correct only when the session's terminal is the frontmost one — hence gated behind the
+    // toggle and clearly labeled experimental. System Events keystrokes need the Accessibility grant.
+    // Allow = "y", Deny = Escape.
+    func sendVSCodeKey(answer: PermAnswer) -> KeyOutcome {
+        guard hasAccessibility(prompt: true) else {
+            permDbg("  sendVSCodeKey: no Accessibility grant → prompted, aborting this click")
+            return .denied   // caller flips the toggle off; user grants then re-enables
+        }
+        let keystroke = answer == .allow ? "keystroke \"y\"" : "key code 53"  // 53 = Escape
+        let script = """
+        tell application "Visual Studio Code" to activate
+        delay 0.15
+        tell application "System Events" to \(keystroke)
+        """
+        var err: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&err)
+        if let err = err {
+            let code = (err["NSAppleScriptErrorNumber"] as? Int) ?? 0
+            permDbg("  sendVSCodeKey error \(code): \(err)")
+            return code == -1743 ? .denied : .unsupported
+        }
+        permDbg("  sendVSCodeKey: sent \(answer) (blind, to focused VS Code terminal)")
+        return .sent
+    }
+
+    // Resolve a tty to its tmux pane id (%N) by matching #{pane_tty}. "" if not found / no server.
+    func tmuxPaneID(forTTY tty: String) -> String? {
+        let dev = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+        guard let bin = tmuxBin else { permDbg("  tmuxPaneID: no tmux binary found"); return nil }
+        let out = runCapture(bin, ["list-panes", "-a", "-F", "#{pane_id} #{pane_tty}"])
+        permDbg("  tmuxPaneID: bin=\(bin) dev=\(dev) list-panes out=\(out ?? "<nil>")")
+        guard let out = out else { return nil }
+        for line in out.split(separator: "\n") {
+            let cols = line.split(separator: " ", maxSplits: 1)
+            if cols.count == 2, cols[1] == Substring(dev) { permDbg("  tmuxPaneID: matched \(cols[0])"); return String(cols[0]) }
+        }
+        permDbg("  tmuxPaneID: no pane matched dev=\(dev)")
+        return nil
+    }
+
+    // Path to the tmux binary (Homebrew arm64 / Intel / system), or nil if tmux isn't installed.
+    var tmuxBin: String? {
+        for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    // Select the pane owning this tty (so a click lands on the exact prompt). Returns false if unfound.
+    @discardableResult
+    func focusTmuxPane(tty: String) -> Bool {
+        guard let bin = tmuxBin, let pane = tmuxPaneID(forTTY: tty) else { return false }
+        // select-window then select-pane so the right window is shown AND the right pane is active.
+        _ = runCapture(bin, ["select-window", "-t", pane])
+        _ = runCapture(bin, ["select-pane", "-t", pane])
+        return true
+    }
+
+    // Deliver the answer keystroke into the tmux pane. Allow = Enter (accepts the highlighted
+    // "Yes" default of the permission prompt); Deny = Escape. send-keys addresses the pane by id,
+    // so it lands regardless of which tmux window is currently shown.
+    func sendTmuxKey(tty: String, answer: PermAnswer) -> KeyOutcome {
+        guard let bin = tmuxBin, let pane = tmuxPaneID(forTTY: tty) else { permDbg("  sendTmuxKey: no bin/pane -> .unsupported"); return .unsupported }
+        _ = runCapture(bin, ["select-window", "-t", pane])
+        _ = runCapture(bin, ["select-pane", "-t", pane])
+        let key = answer == .allow ? "Enter" : "Escape"
+        let r = runCapture(bin, ["send-keys", "-t", pane, key])
+        permDbg("  sendTmuxKey: sent \(key) to \(pane), send-keys out=\(r ?? "<nil>")")
+        return .sent
+    }
+
+    // iTerm: address the session by tty and write the answer straight into it with iTerm's native
+    // `write text` — NO System Events, so this needs only the Automation grant (apple-events), not
+    // the heavier Accessibility grant. The prompt's TUI reads the injected bytes as keystrokes.
+    // Allow = "y", Deny = the Escape byte (). `newline no` so we send just the char, no Enter.
+    func sendITermKey(tty: String, answer: PermAnswer) -> KeyOutcome {
+        let dev = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+        // AppleScript string literal for the char: "y", or the ESC control char via `character id 27`.
+        let textExpr = answer == .allow ? "\"y\"" : "(character id 27)"
+        let script = """
+        tell application "iTerm"
+          activate
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "\(dev)" then
+                  select s
+                  select t
+                  tell w to select
+                  tell s to write text \(textExpr) newline no
+                  return
+                end if
+              end repeat
+            end repeat
+          end repeat
+        end tell
+        """
+        var err: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&err)
+        guard let err = err else { permDbg("  sendITermKey: wrote \(answer) to \(dev)"); return .sent }
+        let code = (err["NSAppleScriptErrorNumber"] as? Int) ?? 0
+        permDbg("  sendITermKey error \(code): \(err)")
+        return code == -1743 ? .denied : .unsupported   // -1743 = errAEEventNotPermitted (grant declined)
+    }
+
+    // Run a command, capture stdout (trimmed). nil on launch failure. Used for tmux queries/sends.
+    @discardableResult
+    func runCapture(_ path: String, _ args: [String]) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: path) else { permDbg("  runCapture: not executable \(path)"); return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe(), errPipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = errPipe
+        do { try p.run() } catch { permDbg("  runCapture: launch failed \(path) \(args): \(error)"); return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        if !errData.isEmpty, let e = String(data: errData, encoding: .utf8) {
+            permDbg("  runCapture stderr[\(args.first ?? "")]: \(e.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Persist the experimental toggle. Explain the macOS Automation grant on the first enable, or again
+    // after a denial (the deny handler clears exactFocusToastShown). Deferred so the menu's toggle
+    // interaction finishes before the modal alert. Only gates the iTerm AppleScript path — tmux
+    // send-keys works without any grant, so tmux Allow/Deny buttons show regardless of this toggle.
+    func setExactTerminalFocus(_ on: Bool) {
+        exactTerminalFocus = on
+        UserDefaults.standard.set(on, forKey: "exactTerminalFocus")
+        guard on, !UserDefaults.standard.bool(forKey: "exactFocusToastShown") else { return }
+        UserDefaults.standard.set(true, forKey: "exactFocusToastShown")
+        DispatchQueue.main.async { [weak self] in self?.showExactFocusToast() }
+    }
+
+    // Clear this app's Apple Events automation decisions so the next AppleScript attempt re-triggers the
+    // macOS prompt (lets a re-enable recover from an earlier denial). tccutil edits the user TCC db, no sudo.
+    func resetAutomationGrant() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", "AppleEvents", Bundle.main.bundleIdentifier ?? "com.local.claudestatusbar"]
+        try? p.run()
+    }
+
+    func showExactFocusToast() {
+        let a = NSAlert()
+        a.messageText = "Exact terminal focus (experimental)"
+        a.informativeText = "When enabled, clicking a CLI session focuses its exact terminal tab, and the Allow/Deny buttons on a permission prompt answer it in the session.\n\nHeads up: for iTerm this needs a one-time prompt from Apple to control it. You can revoke it any time under System Settings > Privacy & Security > Automation. (tmux sessions work without any prompt.)"
+        a.addButton(withTitle: "Got it")
+        a.addButton(withTitle: "Learn more")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertSecondButtonReturn,
+           let url = URL(string: "https://github.com/m1ckc3s/claude-status-bar/issues/19") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    // iTerm grant declined → flip the toggle back off and reset the grant so a re-enable re-prompts.
+    func handleGrantDenied() {
+        setExactTerminalFocus(false)
+        UserDefaults.standard.set(false, forKey: "exactFocusToastShown")
+        resetAutomationGrant()
     }
 
 

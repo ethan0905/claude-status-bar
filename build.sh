@@ -65,12 +65,17 @@ SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
 # carry — codesign rejects them ("resource fork, Finder information, ... not allowed").
 xattr -cr "$APP"
 
+# The apple-events entitlement is REQUIRED for iTerm exact-tab focus + permission Allow/Deny
+# keystroke: a hardened-runtime app can't send Apple Events (AppleScript) without it. tmux
+# keystrokes don't use Apple Events, so they work even without this entitlement/grant.
+ENTITLEMENTS="ClaudeStatusBar.entitlements"
+
 if [[ -n "$SIGN_ID" ]]; then
   echo "Signing with Developer ID: $SIGN_ID"
-  codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+  codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP"
 else
   echo "No Developer ID cert for team $TEAM_ID found — ad-hoc signing (local dev build)."
-  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+  codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP" >/dev/null 2>&1 || true
 fi
 echo "Built $APP"
 
