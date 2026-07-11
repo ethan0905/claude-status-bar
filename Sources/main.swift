@@ -612,8 +612,11 @@ final class StatusController: NSObject, NSMenuDelegate {
     // bare notch when idle. Centered on the notch.
     func collapsedFrame(_ geo: NotchGeometry, _ view: NotchContentView) -> NSRect {
         let band = geo.menuBarHeight > 0 ? geo.menuBarHeight : 30
-        let panelH = band + collapsedLip
         let dcw = view.desiredContentWidth()
+        // Idle (bare notch): match the physical cutout EXACTLY — same width, same height, no lip —
+        // so the resting island is indistinguishable from the camera housing. The lip only exists
+        // while there's flanking content to underline.
+        let panelH = dcw <= 0 ? band : band + collapsedLip
         let panelW = dcw <= 0 ? max(geo.notchRect.width, 1) : dcw + 2 * NotchContentView.sidePad
         return NSRect(x: geo.centerX - panelW / 2, y: geo.topY - panelH, width: panelW, height: panelH)
     }
@@ -643,7 +646,10 @@ final class StatusController: NSObject, NSMenuDelegate {
     func resizeNotchToFit() {
         guard let geo = notchGeo, let win = notchWindow, let view = notchView, !view.expanded else { return }
         let frame = collapsedFrame(geo, view)
-        if abs(frame.width - win.frame.width) > 0.5 { win.setFrame(frame, display: true) }
+        // Height changes too: idle drops the lip to fuse with the camera housing (see collapsedFrame).
+        if abs(frame.width - win.frame.width) > 0.5 || abs(frame.height - win.frame.height) > 0.5 {
+            win.setFrame(frame, display: true)
+        }
         view.needsLayout = true
     }
 
