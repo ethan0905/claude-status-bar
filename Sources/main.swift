@@ -660,38 +660,48 @@ final class StatusController: NSObject, NSMenuDelegate {
         let wasBare = cur.width <= bareW + 0.5
         let isBare = frame.width <= bareW + 0.5
         if wasBare && !isBare {
-            // Activating: park the FULL-SIZE window entirely above the screen edge (clipped =
-            // invisible), then slide its y down into place — a rigid slide-in from the top, no
-            // height growth, no content squash. constrainFrameRect is overridden to allow this.
-            win.setFrame(NSRect(x: frame.minX, y: geo.topY, width: frame.width, height: frame.height),
-                         display: false)
-            view.needsLayout = true
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.28
+            // Activating: the island expands OUT of the camera housing — width grows from the bare
+            // notch to the final size, anchored on the notch center. Content fades in only after
+            // the flanks have room, so text never pops in clipped.
+            view.setFlankAlpha(0)
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.26
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 win.animator().setFrame(frame, display: true)
-            }
-        } else if !wasBare && isBare {
-            // Deactivating: rigid slide fully up behind the edge (reverse of activation), THEN park
-            // on the bare-notch frame (pure black over the cutout — visually nothing) so
-            // hover-to-expand keeps working.
-            let up = NSRect(x: cur.minX, y: geo.topY, width: cur.width, height: cur.height)
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.22
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
-                win.animator().setFrame(up, display: true)
             }, completionHandler: { [weak self] in
-                guard let self = self, let win = self.notchWindow,
+                guard let view = self?.notchView else { return }
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.14
+                    view.animateFlankAlpha(1)
+                }
+            })
+        } else if !wasBare && isBare {
+            // Deactivating: content fades first, then the island contracts back INTO the camera
+            // housing — it ends at exactly the cutout's size, with no visible travel anywhere else.
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.10
+                view.animateFlankAlpha(0)
+            }, completionHandler: { [weak self] in
+                guard let self = self, let win = self.notchWindow, let geo = self.notchGeo,
                       let view = self.notchView, !view.expanded else { return }
-                win.setFrame(frame, display: true)
-                view.needsLayout = true
+                // Reactivated during the fade? Bail; the activation/glide branch owns the frame now.
+                guard view.desiredContentWidth() <= 0 else { view.setFlankAlpha(1); return }
+                NSAnimationContext.runAnimationGroup({ ctx in
+                    ctx.duration = 0.24
+                    ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    win.animator().setFrame(self.collapsedFrame(geo, view), display: true)
+                }, completionHandler: { [weak self] in
+                    self?.notchView?.setFlankAlpha(1)   // fields are empty while idle; ready for next turn
+                })
             })
         } else {
-            // Active-width change (label/timer grew or shrank): quick glide, no jump.
+            // Active-width change (label/timer grew or shrank): quick glide, no jump. Also restores
+            // flank alpha in case a new turn interrupted a mid-fade deactivation.
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.15
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 win.animator().setFrame(frame, display: true)
+                view.animateFlankAlpha(1)
             }
         }
         view.needsLayout = true

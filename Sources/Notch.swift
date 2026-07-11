@@ -351,6 +351,18 @@ final class NotchContentView: NSView {
         needsLayout = true
     }
 
+    // Collapsed flank content (icon + label + timer) fades as one unit during the island's
+    // expand-out-of / contract-into-the-camera animations, so text never visibly clips while
+    // the width changes underneath it.
+    func setFlankAlpha(_ a: CGFloat) {
+        iconView.alphaValue = a; labelField.alphaValue = a; timerField.alphaValue = a
+    }
+    func animateFlankAlpha(_ a: CGFloat) {
+        iconView.animator().alphaValue = a
+        labelField.animator().alphaValue = a
+        timerField.animator().alphaValue = a
+    }
+
     init(frame: NSRect, notchWidth: CGFloat, menuBarHeight: CGFloat) {
         self.notchWidth = notchWidth
         self.menuBarHeight = menuBarHeight
