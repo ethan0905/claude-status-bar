@@ -766,23 +766,33 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     func collapseNotch() {
         guard let geo = notchGeo, let win = notchWindow, let view = notchView, view.expanded else { return }
-        let panelW = max(geo.notchRect.width, view.desiredContentWidth() + 2 * notchContentPad)
-        let panelH = geo.menuBarHeight + notchDrop
-        let frame = NSRect(x: geo.centerX - panelW / 2, y: geo.topY - panelH, width: panelW, height: panelH)
+        // Close straight into the REAL island frame — the bare camera housing when idle, the
+        // flanked pill while working — not an oversized intermediate box (the old target was
+        // band + notchDrop tall, which parked a visibly-too-big black shape after every close).
+        let frame = collapsedFrame(geo, view)
+        view.setFlankAlpha(0)   // keep the collapsed row invisible until the shrink lands
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.24
             ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
             win.animator().setFrame(frame, display: true)
             view.body.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
+            guard let self = self else { return }
             // Tear down the rows only after the fade, so nothing pops out mid-collapse.
-            self?.notchView?.setExpanded(false, bodyHeight: 0)
-            self?.notchView?.body.subviews.forEach { $0.removeFromSuperview() }
-            self?.notchView?.body.alphaValue = 1
-            self?.notchHeroIcon = nil
-            self?.notchHeroTimer = nil
-            self?.notchProgress = nil
-            self?.notchPage = .dashboard   // always reopen on the dashboard
+            self.notchView?.setExpanded(false, bodyHeight: 0)
+            self.notchView?.body.subviews.forEach { $0.removeFromSuperview() }
+            self.notchView?.body.alphaValue = 1
+            self.notchHeroIcon = nil
+            self.notchHeroTimer = nil
+            self.notchProgress = nil
+            self.notchPage = .dashboard   // always reopen on the dashboard
+            // Settle on whatever the island should be NOW (content may have changed mid-close),
+            // then reveal the collapsed row.
+            self.resizeNotchToFit()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.12
+                self.notchView?.animateFlankAlpha(1)
+            }
         })
         notchDbg("collapsed to \(frame)")
     }
