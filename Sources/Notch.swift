@@ -82,6 +82,10 @@ final class NotchWindow: NSPanel {
     }
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+    // Slide-in/out parks the window fully ABOVE the screen edge (clipped = hidden) and animates its
+    // y back into place. AppKit's default constraining would silently clamp those frames back onto
+    // the screen, so opt out entirely — the controller owns this window's geometry.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
 // One clickable row in the expanded island's menu. Rounds a subtle highlight under the pointer and

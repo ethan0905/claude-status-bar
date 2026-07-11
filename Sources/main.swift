@@ -660,17 +660,22 @@ final class StatusController: NSObject, NSMenuDelegate {
         let wasBare = cur.width <= bareW + 0.5
         let isBare = frame.width <= bareW + 0.5
         if wasBare && !isBare {
-            // Activating: start clipped behind the top edge at final width, grow downward.
-            win.setFrame(NSRect(x: frame.minX, y: geo.topY - 1, width: frame.width, height: 1), display: false)
+            // Activating: park the FULL-SIZE window entirely above the screen edge (clipped =
+            // invisible), then slide its y down into place — a rigid slide-in from the top, no
+            // height growth, no content squash. constrainFrameRect is overridden to allow this.
+            win.setFrame(NSRect(x: frame.minX, y: geo.topY, width: frame.width, height: frame.height),
+                         display: false)
+            view.needsLayout = true
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.28
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 win.animator().setFrame(frame, display: true)
             }
         } else if !wasBare && isBare {
-            // Deactivating: retract fully into the top edge, THEN park on the bare-notch frame
-            // (pure black over the cutout — visually nothing) so hover-to-expand keeps working.
-            let up = NSRect(x: cur.minX, y: geo.topY - 1, width: cur.width, height: 1)
+            // Deactivating: rigid slide fully up behind the edge (reverse of activation), THEN park
+            // on the bare-notch frame (pure black over the cutout — visually nothing) so
+            // hover-to-expand keeps working.
+            let up = NSRect(x: cur.minX, y: geo.topY, width: cur.width, height: cur.height)
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.22
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
@@ -679,6 +684,7 @@ final class StatusController: NSObject, NSMenuDelegate {
                 guard let self = self, let win = self.notchWindow,
                       let view = self.notchView, !view.expanded else { return }
                 win.setFrame(frame, display: true)
+                view.needsLayout = true
             })
         } else {
             // Active-width change (label/timer grew or shrank): quick glide, no jump.
