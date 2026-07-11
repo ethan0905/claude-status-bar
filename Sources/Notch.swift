@@ -397,7 +397,10 @@ final class NotchContentView: NSView {
     override func layout() {
         super.layout()
         let w = bounds.width, h = bounds.height
-        let r: CGFloat = expanded ? 18 : min(10, max(4, h - bandHeight))
+        // Collapsed bottom corners match the physical camera housing's curve (~12pt), not the old
+        // lip-capped 6pt that read as a sharp box next to the real notch. Bare-notch idle sits
+        // entirely over the cutout, so its (smaller) rounding is invisible either way.
+        let r: CGFloat = expanded ? 18 : min(12, h / 2)
         // Square top corners (fuse with the notch / top edge); rounded bottom only.
         let path = CGMutablePath()
         path.move(to: CGPoint(x: 0, y: h))
