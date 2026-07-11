@@ -564,10 +564,11 @@ final class StatusController: NSObject, NSMenuDelegate {
             let geo = NotchGeometry.forScreen(screen)
             notchGeo = geo
             notchScreen = screen
-            // Start at bare-notch width; resizeNotchToFit() grows the flanks when a turn is active.
+            // Start on the bare-notch frame — exactly the physical cutout, no lip, visually nothing.
+            // resizeNotchToFit() slides the flanks in when a turn becomes active.
             let band = geo.menuBarHeight > 0 ? geo.menuBarHeight : 30
-            let frame = NSRect(x: geo.centerX - max(geo.notchRect.width, 1) / 2, y: geo.topY - (band + collapsedLip),
-                               width: max(geo.notchRect.width, 1), height: band + collapsedLip)
+            let frame = NSRect(x: geo.centerX - max(geo.notchRect.width, 1) / 2, y: geo.topY - band,
+                               width: max(geo.notchRect.width, 1), height: band)
             let win = notchWindow ?? NotchWindow(contentRect: frame)
             win.setFrame(frame, display: true)
             let view = notchView ?? NotchContentView(frame: NSRect(origin: .zero, size: frame.size),
@@ -643,12 +644,49 @@ final class StatusController: NSObject, NSMenuDelegate {
     // Grow/shrink the collapsed pill to hug the current header content, keeping it centered on the
     // notch and never narrower than the notch itself (so the top always fuses with the cutout). No-op
     // while expanded — the expanded frame is owned by expandNotch().
+    // Collapsed-frame transitions, animated like the iPhone island: activation slides DOWN from the
+    // top screen edge (not sideways out of the notch), deactivation retracts fully INTO the edge
+    // (height -> ~0) before parking on the bare-notch frame — so the resting state never flashes
+    // the band+lip box. Width-only changes while active glide instead of jumping.
     func resizeNotchToFit() {
         guard let geo = notchGeo, let win = notchWindow, let view = notchView, !view.expanded else { return }
         let frame = collapsedFrame(geo, view)
-        // Height changes too: idle drops the lip to fuse with the camera housing (see collapsedFrame).
-        if abs(frame.width - win.frame.width) > 0.5 || abs(frame.height - win.frame.height) > 0.5 {
-            win.setFrame(frame, display: true)
+        let cur = win.frame
+        if abs(frame.width - cur.width) <= 0.5 && abs(frame.height - cur.height) <= 0.5 {
+            view.needsLayout = true
+            return
+        }
+        let bareW = max(geo.notchRect.width, 1)
+        let wasBare = cur.width <= bareW + 0.5
+        let isBare = frame.width <= bareW + 0.5
+        if wasBare && !isBare {
+            // Activating: start clipped behind the top edge at final width, grow downward.
+            win.setFrame(NSRect(x: frame.minX, y: geo.topY - 1, width: frame.width, height: 1), display: false)
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.28
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                win.animator().setFrame(frame, display: true)
+            }
+        } else if !wasBare && isBare {
+            // Deactivating: retract fully into the top edge, THEN park on the bare-notch frame
+            // (pure black over the cutout — visually nothing) so hover-to-expand keeps working.
+            let up = NSRect(x: cur.minX, y: geo.topY - 1, width: cur.width, height: 1)
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                win.animator().setFrame(up, display: true)
+            }, completionHandler: { [weak self] in
+                guard let self = self, let win = self.notchWindow,
+                      let view = self.notchView, !view.expanded else { return }
+                win.setFrame(frame, display: true)
+            })
+        } else {
+            // Active-width change (label/timer grew or shrank): quick glide, no jump.
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.15
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                win.animator().setFrame(frame, display: true)
+            }
         }
         view.needsLayout = true
     }
