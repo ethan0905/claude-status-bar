@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; overflow:hidden; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    color:#f5f1ea;
+  }
+  a { color:#d97757; text-decoration:none; }
+  a:hover { color:#c4653f; }
+  @keyframes ping { 0%{ transform:scale(.7); opacity:.55 } 80%,100%{ transform:scale(2.3); opacity:0 } }
+  @keyframes breathe { 0%,100%{ transform:scale(1) } 50%{ transform:scale(1.14) } }
+  @keyframes glyphSpin { to { transform:rotate(360deg) } }
+  @keyframes waddle { 0%,100%{ transform:rotate(-9deg) } 50%{ transform:rotate(9deg) } }
+  @keyframes slide { 0%{ transform:translateX(-130%) } 100%{ transform:translateX(360%) } }
+  @keyframes blink { 0%,100%{ opacity:1 } 50%{ opacity:.4 } }
+  @keyframes rise { from{ opacity:0; transform:translateY(7px) } to{ opacity:1; transform:translateY(0) } }
+  @keyframes floaty { 0%,100%{ transform:translateY(0) } 50%{ transform:translateY(-3px) } }
+</style>
+</helmet>
+<div style="position:absolute; inset:0; background:
+      radial-gradient(120% 90% at 50% -10%, #f0c9a8 0%, #e6a97f 22%, #cf8a63 45%, #7d5540 72%, #40332b 100%);
+      overflow:hidden;">
+
+  <!-- ambient light blobs -->
+  <div style="position:absolute; width:900px; height:900px; left:-260px; top:-380px; border-radius:50%;
+        background:radial-gradient(circle, rgba(255,240,220,.32), transparent 66%); pointer-events:none;"></div>
+  <div style="position:absolute; width:760px; height:760px; right:-220px; bottom:-320px; border-radius:50%;
+        background:radial-gradient(circle, rgba(217,119,87,.3), transparent 68%); pointer-events:none;"></div>
+
+  <!-- ============ MENU BAR ============ -->
+  <div style="position:absolute; top:0; left:0; right:0; height:30px; display:flex; align-items:center;
+        justify-content:space-between; padding:0 16px; background:rgba(28,22,18,.22);
+        backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px); font-size:13px; z-index:5;
+        color:rgba(255,255,255,.92);">
+    <div style="display:flex; align-items:center; gap:18px;">
+      <span style="font-size:15px;">&#63743;</span>
+      <span style="font-weight:700;">Claude</span>
+      <span style="opacity:.9;">File</span><span style="opacity:.9;">Edit</span>
+      <span style="opacity:.9;">View</span><span style="opacity:.9;">Window</span><span style="opacity:.9;">Help</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:15px; opacity:.95;">
+      <svg width="18" height="13" viewBox="0 0 18 13" fill="none"><path d="M9 3.2C6.8 3.2 4.8 4 3.3 5.4M9 6.4c-1.3 0-2.5.5-3.4 1.3M1 3C3.2 1 6 0 9 0s5.8 1 8 3M9 10.4a1.1 1.1 0 100 2.2 1.1 1.1 0 000-2.2z" stroke="#fff" stroke-width="1.4" stroke-linecap="round"/></svg>
+      <svg width="26" height="13" viewBox="0 0 26 13" fill="none"><rect x=".7" y="1.2" width="21" height="10.6" rx="3" stroke="#fff" stroke-opacity=".7" stroke-width="1.2"/><rect x="2.4" y="2.9" width="15" height="7.2" rx="1.4" fill="#fff"/><path d="M23.6 4.4v4.2c1-.4 1-3.8 0-4.2z" fill="#fff" fill-opacity=".7"/></svg>
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5.4" stroke="#fff" stroke-width="1.5"/><path d="M11 11l3.4 3.4" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <svg width="16" height="15" viewBox="0 0 18 16" fill="none"><rect x="1" y="1.4" width="16" height="13" rx="3.4" stroke="#fff" stroke-width="1.4"/><circle cx="6" cy="8" r="1.9" fill="#fff"/><path d="M10 8h4M10 5.6h4M10 10.4h4" stroke="#fff" stroke-width="1.3" stroke-linecap="round"/></svg>
+      <span style="font-variant-numeric:tabular-nums;">Wed 8 Jul&nbsp;&nbsp;15:31</span>
+    </div>
+  </div>
+
+  <!-- ============ THE ISLAND ============ -->
+  <div style="position:absolute; top:0; left:50%; transform:translateX(-50%); z-index:20; display:flex; flex-direction:column; align-items:center;">
+    <div onMouseEnter="{{ onEnter }}" onMouseLeave="{{ onLeave }}" onClick="{{ onIslandClick }}"
+         style="width: {{ islandWidth }}; background:#141210; color:#f5f1ea; cursor:pointer;
+                border-radius: 0 0 22px 22px; box-shadow: 0 22px 55px -14px rgba(0,0,0,.62), 0 0 0 1px rgba(255,255,255,.05);
+                overflow:hidden; transition: width .46s cubic-bezier(.22,1,.36,1);">
+
+      <!-- top bar (the notch line) -->
+      <div style="height:38px; display:flex; align-items:center; justify-content:center; padding:0 14px;">
+        <sc-if value="{{ isIdle }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex; align-items:center; gap:8px; opacity:.62; width:100%; justify-content:center;">
+            <span style="font-size:14px; color:#8a857c; display:inline-block; animation:floaty 3.4s ease-in-out infinite;">{{ glyph }}</span>
+            <span style="font-size:12.5px; color:#b9b3aa; letter-spacing:.2px;">Idle</span>
+          </div>
+        </sc-if>
+        <sc-if value="{{ notIdle }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex; align-items:center; gap:9px; width:100%;">
+            <!-- icon slot -->
+            <div style="position:relative; width:20px; height:20px; flex:0 0 auto; display:flex; align-items:center; justify-content:center;">
+              <sc-if value="{{ showRings }}" hint-placeholder-val="{{ true }}">
+                <span style="position:absolute; inset:1px; border-radius:50%; border:1.5px solid {{ accent }}; animation:ping 1.9s cubic-bezier(0,.5,.5,1) infinite;"></span>
+              </sc-if>
+              <sc-if value="{{ isDone }}" hint-placeholder-val="{{ false }}">
+                <span style="width:18px; height:18px; border-radius:50%; background:#4f9e6a; display:flex; align-items:center; justify-content:center;">
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.4l2.2 2.2 4.8-5" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </span>
+              </sc-if>
+              <sc-if value="{{ isGlyphIcon }}" hint-placeholder-val="{{ true }}">
+                <span style="font-size:15px; color:{{ accent }}; display:inline-block; animation:glyphSpin 9s linear infinite, breathe 2.3s ease-in-out infinite;">{{ glyph }}</span>
+              </sc-if>
+              <sc-if value="{{ isCrab }}" hint-placeholder-val="{{ false }}">
+                <span style="font-size:15px; display:inline-block; animation:waddle 1.1s ease-in-out infinite;">&#129408;</span>
+              </sc-if>
+            </div>
+            <span style="flex:1 1 auto; font-size:13px; font-weight:500; letter-spacing:.1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#f2ede4;">{{ focusLine }}</span>
+            <sc-if value="{{ showTimerChip }}" hint-placeholder-val="{{ true }}">
+              <span style="font-size:12px; font-weight:600; font-variant-numeric:tabular-nums; color:{{ accent }}; font-family:ui-monospace,'SF Mono',monospace; flex:0 0 auto;">{{ timerText }}</span>
+            </sc-if>
+          </div>
+        </sc-if>
+      </div>
+
+      <!-- ============ DRAWER (hover-expanded) ============ -->
+      <div style="max-height: {{ drawerMax }}; opacity: {{ drawerOpacity }}; overflow:hidden; transition: max-height .46s cubic-bezier(.22,1,.36,1), opacity .3s ease;">
+        <div style="padding:2px 16px 16px;">
+
+          <!-- header row -->
+          <div style="display:flex; align-items:center; justify-content:space-between; padding:6px 2px 12px; border-bottom:1px solid rgba(255,255,255,.07);">
+            <sc-if value="{{ isDashboard }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex; align-items:baseline; gap:8px;">
+                <span style="font-family:'Newsreader',serif; font-size:21px; font-weight:500; color:#faf7f2;">Claude</span>
+                <span style="font-size:9.5px; letter-spacing:1.6px; color:#8a857c; font-weight:600;">STATUS</span>
+              </div>
+            </sc-if>
+            <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+              <button onClick="{{ goDashboard }}" style="display:flex; align-items:center; gap:7px; background:none; border:none; color:#f2ede4; cursor:pointer; padding:0; font-size:14px; font-weight:500; font-family:inherit;">
+                <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M10 3l-5 5 5 5" stroke="#f2ede4" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                Settings
+              </button>
+            </sc-if>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <sc-if value="{{ isDashboard }}" hint-placeholder-val="{{ true }}">
+                <span style="font-size:11px; color:#b9b3aa; background:rgba(255,255,255,.07); padding:3px 9px; border-radius:20px; font-weight:600;">{{ activeCount }} active</span>
+              </sc-if>
+              <button onClick="{{ toggleSettings }}" style="width:28px; height:28px; border-radius:8px; border:none; background:rgba(255,255,255,.06); cursor:pointer; display:flex; align-items:center; justify-content:center;"
+                      style-hover="background:rgba(255,255,255,.13);">
+                <svg width="16" height="16" viewBox="0 0 18 18" fill="none"><circle cx="9" cy="9" r="2.4" stroke="#d8d2c8" stroke-width="1.5"/><path d="M9 1.5v2.2M9 14.3v2.2M16.5 9h-2.2M3.7 9H1.5M14.3 3.7l-1.6 1.6M5.3 12.7l-1.6 1.6M14.3 14.3l-1.6-1.6M5.3 5.3L3.7 3.7" stroke="#d8d2c8" stroke-width="1.5" stroke-linecap="round"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <!-- ===== DASHBOARD PAGE ===== -->
+          <sc-if value="{{ isDashboard }}" hint-placeholder-val="{{ true }}">
+            <div>
+              <!-- hero card -->
+              <div style="margin-top:12px; background:linear-gradient(160deg, rgba(255,255,255,.055), rgba(255,255,255,.02)); border:1px solid rgba(255,255,255,.08); border-radius:16px; padding:15px 16px; animation:rise .4s ease both;">
+                <div style="display:flex; align-items:center; gap:13px;">
+                  <!-- big icon -->
+                  <div style="position:relative; width:44px; height:44px; flex:0 0 auto; display:flex; align-items:center; justify-content:center; border-radius:13px; background:{{ accentSoft }};">
+                    <sc-if value="{{ showRings }}" hint-placeholder-val="{{ true }}">
+                      <span style="position:absolute; inset:6px; border-radius:50%; border:1.5px solid {{ accent }}; animation:ping 1.9s cubic-bezier(0,.5,.5,1) infinite;"></span>
+                    </sc-if>
+                    <sc-if value="{{ isDone }}" hint-placeholder-val="{{ false }}">
+                      <span style="width:26px; height:26px; border-radius:50%; background:#4f9e6a; display:flex; align-items:center; justify-content:center;">
+                        <svg width="15" height="15" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.4l2.2 2.2 4.8-5" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                      </span>
+                    </sc-if>
+                    <sc-if value="{{ isGlyphIcon }}" hint-placeholder-val="{{ true }}">
+                      <span style="font-size:22px; color:{{ accent }}; display:inline-block; animation:glyphSpin 9s linear infinite, breathe 2.3s ease-in-out infinite;">{{ glyph }}</span>
+                    </sc-if>
+                    <sc-if value="{{ isCrab }}" hint-placeholder-val="{{ false }}">
+                      <span style="font-size:24px; display:inline-block; animation:waddle 1.1s ease-in-out infinite;">&#129408;</span>
+                    </sc-if>
+                  </div>
+                  <div style="flex:1 1 auto; min-width:0;">
+                    <div style="font-size:15px; font-weight:600; color:#faf7f2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ focusName }}</div>
+                    <div style="font-size:12px; color:#8a857c; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ focusProj }}</div>
+                  </div>
+                  <div style="text-align:right; flex:0 0 auto;">
+                    <div style="font-size:12px; font-weight:600; color:{{ accent }};">{{ focusLine }}</div>
+                    <sc-if value="{{ showHeroTimer }}" hint-placeholder-val="{{ true }}">
+                      <div style="font-size:19px; font-weight:600; font-variant-numeric:tabular-nums; color:#faf7f2; font-family:ui-monospace,'SF Mono',monospace; margin-top:2px;">{{ timerText }}</div>
+                    </sc-if>
+                  </div>
+                </div>
+
+                <!-- tool chip -->
+                <sc-if value="{{ showToolChip }}" hint-placeholder-val="{{ false }}">
+                  <div style="margin-top:12px; background:rgba(0,0,0,.32); border:1px solid rgba(255,255,255,.06); border-radius:9px; padding:8px 11px; font-family:ui-monospace,'SF Mono',monospace; font-size:12px; color:#e8ddd0; display:flex; align-items:center; gap:8px;">
+                    <span style="color:#e8a72d; font-weight:700;">$</span>
+                    <span style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ focusTool }}</span>
+                  </div>
+                </sc-if>
+
+                <!-- progress shimmer -->
+                <sc-if value="{{ showProgress }}" hint-placeholder-val="{{ true }}">
+                  <div style="margin-top:13px; height:3px; border-radius:3px; background:rgba(255,255,255,.09); overflow:hidden;">
+                    <div style="width:40%; height:100%; border-radius:3px; background:linear-gradient(90deg, transparent, {{ accent }}, transparent); animation:slide 1.5s cubic-bezier(.5,0,.5,1) infinite;"></div>
+                  </div>
+                </sc-if>
+
+                <!-- actions -->
+                <sc-if value="{{ isPermission }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex; gap:8px; margin-top:13px;">
+                    <button onClick="{{ approve }}" style="flex:1; background:#4f9e6a; color:#fff; border:none; border-radius:9px; padding:9px; font-size:13px; font-weight:600; cursor:pointer; font-family:inherit;" style-hover="background:#438a5b;">Allow</button>
+                    <button onClick="{{ deny }}" style="flex:1; background:rgba(255,255,255,.08); color:#f2ede4; border:1px solid rgba(255,255,255,.12); border-radius:9px; padding:9px; font-size:13px; font-weight:600; cursor:pointer; font-family:inherit;" style-hover="background:rgba(255,255,255,.14);">Deny</button>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ showJump }}" hint-placeholder-val="{{ true }}">
+                  <button onClick="{{ jump }}" style="width:100%; margin-top:13px; background:rgba(255,255,255,.06); color:#f2ede4; border:1px solid rgba(255,255,255,.1); border-radius:9px; padding:9px; font-size:13px; font-weight:500; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:7px; font-family:inherit;" style-hover="background:rgba(255,255,255,.12);">
+                    Jump to session
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 8h9M8 4l4 4-4 4" stroke="#f2ede4" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  </button>
+                </sc-if>
+              </div>
+
+              <!-- sessions list -->
+              <div style="margin-top:16px;">
+                <div style="font-size:10px; letter-spacing:1.5px; color:#7c766d; font-weight:700; padding:0 2px 8px;">SESSIONS</div>
+                <div style="display:flex; flex-direction:column; gap:2px;">
+                  <sc-for list="{{ sessions }}" as="s" hint-placeholder-count="4">
+                    <button onClick="{{ s.onClick }}" style="display:flex; align-items:center; gap:11px; width:100%; text-align:left; background:{{ s.rowBg }}; border:none; border-radius:10px; padding:9px 11px; cursor:pointer; font-family:inherit;" style-hover="background:rgba(255,255,255,.06);">
+                      <span style="width:8px; height:8px; border-radius:50%; flex:0 0 auto; background:{{ s.dot }}; box-shadow:0 0 0 3px {{ s.dotSoft }}; animation:{{ s.dotAnim }};"></span>
+                      <div style="flex:1 1 auto; min-width:0;">
+                        <div style="font-size:13px; font-weight:500; color:#f2ede4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ s.name }}</div>
+                        <div style="font-size:11px; color:#7c766d; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{{ s.line }}</div>
+                      </div>
+                      <span style="font-size:11px; font-variant-numeric:tabular-nums; color:#9a948b; font-family:ui-monospace,'SF Mono',monospace; flex:0 0 auto;">{{ s.timer }}</span>
+                      <span style="font-size:10px; font-weight:700; letter-spacing:.3px; color:{{ s.dot }}; background:{{ s.dotSoft }}; padding:3px 7px; border-radius:6px; flex:0 0 auto;">{{ s.tag }}</span>
+                    </button>
+                  </sc-for>
+                </div>
+              </div>
+            </div>
+          </sc-if>
+
+          <!-- ===== SETTINGS PAGE ===== -->
+          <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+            <div style="animation:rise .35s ease both; padding-top:6px;">
+
+              <div style="font-size:10px; letter-spacing:1.5px; color:#7c766d; font-weight:700; padding:6px 2px 9px;">ICON STYLE</div>
+              <div style="display:flex; gap:6px;">
+                <sc-for list="{{ animOptions }}" as="o" hint-placeholder-count="3">
+                  <button onClick="{{ o.onClick }}" style="flex:1; background:{{ o.bg }}; border:1px solid {{ o.border }}; border-radius:11px; padding:11px 6px; cursor:pointer; display:flex; flex-direction:column; align-items:center; gap:6px; font-family:inherit; transition:all .18s ease;">
+                    <span style="font-size:20px; color:{{ o.iconColor }}; height:22px; display:flex; align-items:center;">{{ o.icon }}</span>
+                    <span style="font-size:11.5px; font-weight:600; color:{{ o.textColor }};">{{ o.label }}</span>
+                  </button>
+                </sc-for>
+              </div>
+
+              <div style="font-size:10px; letter-spacing:1.5px; color:#7c766d; font-weight:700; padding:16px 2px 9px;">ACCENT</div>
+              <div style="display:flex; gap:6px;">
+                <sc-for list="{{ colorOptions }}" as="c" hint-placeholder-count="2">
+                  <button onClick="{{ c.onClick }}" style="flex:1; background:{{ c.bg }}; border:1px solid {{ c.border }}; border-radius:11px; padding:10px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; font-family:inherit; transition:all .18s ease;">
+                    <span style="width:14px; height:14px; border-radius:50%; background:{{ c.swatch }}; box-shadow:0 0 0 1px rgba(255,255,255,.15);"></span>
+                    <span style="font-size:12.5px; font-weight:600; color:{{ c.textColor }};">{{ c.label }}</span>
+                  </button>
+                </sc-for>
+              </div>
+
+              <div style="font-size:10px; letter-spacing:1.5px; color:#7c766d; font-weight:700; padding:18px 2px 6px;">BEHAVIOUR</div>
+              <div style="display:flex; flex-direction:column;">
+                <sc-for list="{{ toggles }}" as="t" hint-placeholder-count="4">
+                  <div onClick="{{ t.onClick }}" style="display:flex; align-items:center; gap:12px; padding:11px 2px; cursor:pointer; border-bottom:1px solid rgba(255,255,255,.05);">
+                    <div style="flex:1 1 auto;">
+                      <div style="font-size:13.5px; font-weight:500; color:#f2ede4;">{{ t.label }}</div>
+                      <div style="font-size:11.5px; color:#7c766d; margin-top:1px;">{{ t.desc }}</div>
+                    </div>
+                    <span style="width:40px; height:24px; border-radius:20px; background:{{ t.track }}; position:relative; flex:0 0 auto; transition:background .22s ease;">
+                      <span style="position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.35); transform:translateX({{ t.knobX }}); transition:transform .22s cubic-bezier(.4,0,.2,1);"></span>
+                    </span>
+                  </div>
+                </sc-for>
+              </div>
+
+              <div style="font-size:10px; letter-spacing:1.5px; color:#7c766d; font-weight:700; padding:18px 2px 9px;">HIDE IDLE SESSIONS AFTER</div>
+              <div style="display:flex; gap:4px; background:rgba(0,0,0,.25); padding:4px; border-radius:12px;">
+                <sc-for list="{{ idleOptions }}" as="i" hint-placeholder-count="5">
+                  <button onClick="{{ i.onClick }}" style="flex:1; background:{{ i.bg }}; border:none; border-radius:9px; padding:8px 4px; cursor:pointer; font-size:12px; font-weight:600; color:{{ i.textColor }}; font-family:inherit; transition:all .18s ease;">{{ i.label }}</button>
+                </sc-for>
+              </div>
+
+              <div style="text-align:center; font-size:10.5px; color:#5f5a52; padding:16px 0 4px;">Claude Status Bar &middot; v2.0</div>
+            </div>
+          </sc-if>
+
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ PROTOTYPE CONTROLS ============ -->
+  <sc-if value="{{ showControls }}" hint-placeholder-val="{{ true }}">
+    <div style="position:absolute; bottom:26px; left:50%; transform:translateX(-50%); z-index:30; display:flex; flex-direction:column; align-items:center; gap:9px;">
+      <div style="font-size:10.5px; letter-spacing:1.4px; color:rgba(255,255,255,.6); font-weight:600; text-shadow:0 1px 3px rgba(0,0,0,.4);">PREVIEW STATES &middot; HOVER THE NOTCH TO EXPAND</div>
+      <div style="display:flex; align-items:center; gap:4px; background:rgba(20,18,16,.55); backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px); border:1px solid rgba(255,255,255,.12); border-radius:16px; padding:6px; box-shadow:0 18px 40px -12px rgba(0,0,0,.55);">
+        <sc-for list="{{ stateButtons }}" as="b" hint-placeholder-count="5">
+          <button onClick="{{ b.onClick }}" style="background:{{ b.bg }}; border:none; border-radius:11px; padding:9px 14px; cursor:pointer; font-size:12.5px; font-weight:600; color:{{ b.textColor }}; font-family:inherit; display:flex; align-items:center; gap:7px; transition:all .16s ease;">
+            <span style="width:7px; height:7px; border-radius:50%; background:{{ b.dot }};"></span>
+            {{ b.label }}
+          </button>
+        </sc-for>
+        <div style="width:1px; height:22px; background:rgba(255,255,255,.14); margin:0 3px;"></div>
+        <button onClick="{{ toggleExpand }}" style="background:{{ expandBtnBg }}; border:none; border-radius:11px; padding:9px 14px; cursor:pointer; font-size:12.5px; font-weight:600; color:{{ expandBtnText }}; font-family:inherit; transition:all .16s ease;">{{ expandLabel }}</button>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#d97757&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;startMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;working&quot;,&quot;options&quot;:[&quot;idle&quot;,&quot;thinking&quot;,&quot;working&quot;,&quot;permission&quot;,&quot;done&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Theme&quot;},&quot;showControls&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Prototype&quot;}}">
+class Component extends DCLogic {
+  state = {
+    mode: this.props.startMode || 'working',
+    expanded: false,
+    page: 'dashboard',
+    sec: 77,
+    tick: 0,
+    word: 'Percolating',
+    animStyle: 'sparkle',
+    iconColorMode: 'brand',
+    showTimer: true,
+    sound: true,
+    playful: true,
+    atNotch: true,
+    hideIdle: '30m',
+    hover: false,
+  };
+
+  words = ['Percolating','Manifesting','Cogitating','Noodling','Simmering','Conjuring','Pondering','Ruminating','Crafting','Orchestrating'];
+  codeGlyphs = ['\u273B','\u273D','\u2736','\u2733','\u2722'];
+
+  componentDidMount() {
+    this._t1 = setInterval(() => { if (this.active()) this.setState(s => ({ sec: s.sec + 1 })); }, 1000);
+    this._t2 = setInterval(() => this.setState(s => ({ tick: s.tick + 1 })), 480);
+    this._t3 = setInterval(() => {
+      if (this.state.mode === 'thinking' && this.state.playful) this.setState({ word: this.pick() });
+    }, 2400);
+  }
+  componentWillUnmount() { clearInterval(this._t1); clearInterval(this._t2); clearInterval(this._t3); clearTimeout(this._done); clearTimeout(this._collapse); }
+
+  active() { const m = this.state.mode; return m === 'thinking' || m === 'working' || m === 'permission'; }
+  pick() { return this.words[Math.floor(Math.random() * this.words.length)]; }
+  fmt(sec) { const m = Math.floor(sec / 60), s = sec % 60; return m > 0 ? m + 'm ' + String(s).padStart(2, '0') + 's' : s + 's'; }
+
+  brand() { return this.props.accent || '#d97757'; }
+  accentFor(mode) {
+    if (mode === 'permission') return '#e8a72d';
+    if (mode === 'done') return '#4f9e6a';
+    if (mode === 'idle') return '#8a857c';
+    return this.brand();
+  }
+
+  setMode(m) {
+    const st = { mode: m };
+    if (m === 'thinking') { st.word = this.pick(); st.sec = 42; }
+    else if (m === 'working') st.sec = 77;
+    else if (m === 'permission') st.sec = 8;
+    this.setState(st);
+    clearTimeout(this._done);
+    if (m === 'done') this._done = setTimeout(() => this.setState({ mode: 'idle' }), 4200);
+  }
+
+  glyphChar() {
+    if (this.state.animStyle === 'crab') return '\uD83E\uDD80';
+    if (this.state.animStyle === 'code') return this.codeGlyphs[this.state.tick % this.codeGlyphs.length];
+    return '\u273B';
+  }
+
+  onEnter = () => { clearTimeout(this._collapse); this.setState({ expanded: true }); };
+  onLeave = () => { this._collapse = setTimeout(() => this.setState({ expanded: false, page: 'dashboard' }), 420); };
+  onIslandClick = () => { if (!this.state.expanded) this.setState({ expanded: true }); };
+
+  hexSoft(hex, a) {
+    const h = hex.replace('#',''); const n = parseInt(h,16);
+    const r = (n>>16)&255, g = (n>>8)&255, b = n&255;
+    return 'rgba('+r+','+g+','+b+','+a+')';
+  }
+
+  sessionData() {
+    return [
+      { id:'a', name:'schox_accounting', line:'Running command', timer:'1m 17s', kind:'working', tag:'RUN' },
+      { id:'b', name:'design-system', line:'Percolating\u2026', timer:'42s', kind:'thinking', tag:'THINK' },
+      { id:'c', name:'api-gateway', line:'Permission needed', timer:'0m 08s', kind:'permission', tag:'WAIT' },
+      { id:'d', name:'marketing-site', line:'Done', timer:'4m 02s', kind:'done', tag:'DONE' },
+      { id:'e', name:'notes-app', line:'Idle', timer:'\u2014', kind:'idle', tag:'IDLE' },
+    ];
+  }
+
+  renderVals() {
+    const s = this.state;
+    const mode = s.mode;
+    const accent = this.accentFor(mode);
+    const active = this.active();
+
+    const focusMap = {
+      working:    { name:'schox_accounting', proj:'~/dev/accounting', line:'Running command', tool:'npm run test:e2e' },
+      thinking:   { name:'design-system',    proj:'~/design/ds',      line: (s.playful ? s.word : 'Thinking') + '\u2026', tool:'' },
+      permission: { name:'api-gateway',       proj:'~/dev/api-gateway', line:'Permission needed', tool:'Bash \u00b7 rm -rf ./build' },
+      done:       { name:'marketing-site',    proj:'~/www/marketing',  line:'Done', tool:'' },
+      idle:       { name:'\u2014', proj:'', line:'Idle', tool:'' },
+    };
+    const f = focusMap[mode];
+
+    let timerText = '';
+    if (mode === 'done') timerText = '4m 02s';
+    else if (active) timerText = this.fmt(s.sec);
+
+    const collapsedWidth = { idle:138, done:212, permission:322, working:250, thinking:248 }[mode] || 240;
+    const islandWidth = s.expanded ? '520px' : collapsedWidth + 'px';
+
+    const isGlyphIcon = (s.animStyle === 'sparkle' || s.animStyle === 'code') && active;
+    const isCrab = s.animStyle === 'crab' && active;
+
+    // sessions
+    const sessions = this.sessionData().map(x => {
+      const c = this.accentFor(x.kind);
+      const isActiveKind = x.kind === 'thinking' || x.kind === 'working' || x.kind === 'permission';
+      return {
+        ...x,
+        dot: c,
+        dotSoft: this.hexSoft(c, 0.18),
+        dotAnim: isActiveKind ? 'blink 1.6s ease-in-out infinite' : 'none',
+        rowBg: x.kind === mode ? 'rgba(255,255,255,.05)' : 'transparent',
+        onClick: () => this.setMode(x.kind),
+      };
+    });
+
+    // settings — icon style
+    const mkAnim = (key, label, icon) => {
+      const on = s.animStyle === key;
+      return { key, label, icon,
+        bg: on ? this.hexSoft(this.brand(), 0.14) : 'rgba(255,255,255,.04)',
+        border: on ? this.brand() : 'rgba(255,255,255,.08)',
+        iconColor: on ? this.brand() : '#9a948b',
+        textColor: on ? '#faf7f2' : '#9a948b',
+        onClick: () => this.setState({ animStyle: key }),
+      };
+    };
+    const animOptions = [ mkAnim('sparkle','Sparkle','\u273B'), mkAnim('code','Code','\u2733'), mkAnim('crab','Crab','\uD83E\uDD80') ];
+
+    // accent color
+    const mkColor = (key, label, swatch) => {
+      const on = s.iconColorMode === key;
+      return { key, label, swatch,
+        bg: on ? 'rgba(255,255,255,.09)' : 'rgba(255,255,255,.04)',
+        border: on ? 'rgba(255,255,255,.2)' : 'rgba(255,255,255,.08)',
+        textColor: on ? '#faf7f2' : '#9a948b',
+        onClick: () => this.setState({ iconColorMode: key }),
+      };
+    };
+    const colorOptions = [ mkColor('brand','Brand Orange', this.brand()), mkColor('adaptive','Adaptive', '#e8e2d8') ];
+
+    // toggles
+    const mkToggle = (key, label, desc) => {
+      const on = s[key];
+      return { key, label, desc,
+        track: on ? this.brand() : 'rgba(255,255,255,.14)',
+        knobX: on ? '16px' : '0px',
+        onClick: () => this.setState(st => ({ [key]: !st[key] })),
+      };
+    };
+    const toggles = [
+      mkToggle('showTimer','Show elapsed timer','Live turn duration in the notch'),
+      mkToggle('sound','Completion sound','Chime when a long turn finishes'),
+      mkToggle('playful','Playful thinking words','\u201cManifesting\u2026\u201d instead of \u201cThinking\u2026\u201d'),
+      mkToggle('atNotch','Live at the notch','Hide the menu-bar item, dock to the notch'),
+    ];
+
+    // hide idle
+    const mkIdle = (key, label) => {
+      const on = s.hideIdle === key;
+      return { key, label,
+        bg: on ? this.brand() : 'transparent',
+        textColor: on ? '#fff' : '#9a948b',
+        onClick: () => this.setState({ hideIdle: key }),
+      };
+    };
+    const idleOptions = [ mkIdle('never','Never'), mkIdle('5m','5m'), mkIdle('15m','15m'), mkIdle('30m','30m'), mkIdle('1h','1h') ];
+
+    // state control buttons
+    const mkBtn = (m, label) => {
+      const on = mode === m;
+      const c = this.accentFor(m);
+      return { label, dot: c,
+        bg: on ? this.hexSoft(c, 0.9) : 'rgba(255,255,255,.06)',
+        textColor: on ? '#1a1613' : '#e8e2d8',
+        onClick: () => this.setMode(m),
+      };
+    };
+    const stateButtons = [ mkBtn('thinking','Thinking'), mkBtn('working','Working'), mkBtn('permission','Permission'), mkBtn('done','Done'), mkBtn('idle','Idle') ];
+
+    return {
+      // island
+      islandWidth,
+      accent,
+      accentSoft: this.hexSoft(accent, 0.16),
+      glyph: this.glyphChar(),
+      isIdle: mode === 'idle',
+      notIdle: mode !== 'idle',
+      isDone: mode === 'done',
+      isPermission: mode === 'permission',
+      isGlyphIcon,
+      isCrab,
+      showRings: active,
+      focusLine: f.line,
+      focusName: f.name,
+      focusProj: f.proj,
+      focusTool: f.tool,
+      timerText,
+      showTimerChip: s.showTimer && !!timerText,
+      showHeroTimer: (s.showTimer && !!timerText) || mode === 'done',
+      showToolChip: (mode === 'permission' || mode === 'working') && !!f.tool,
+      showProgress: mode === 'working',
+      showJump: mode !== 'permission' && mode !== 'idle',
+
+      // drawer
+      drawerMax: s.expanded ? '720px' : '0px',
+      drawerOpacity: s.expanded ? '1' : '0',
+      isDashboard: s.page === 'dashboard',
+      isSettings: s.page === 'settings',
+      activeCount: sessions.filter(x => x.kind==='thinking'||x.kind==='working'||x.kind==='permission').length,
+
+      // handlers
+      onEnter: this.onEnter,
+      onLeave: this.onLeave,
+      onIslandClick: this.onIslandClick,
+      toggleSettings: () => this.setState(st => ({ page: st.page === 'settings' ? 'dashboard' : 'settings' })),
+      goDashboard: () => this.setState({ page: 'dashboard' }),
+      jump: () => {},
+      approve: () => this.setMode('working'),
+      deny: () => this.setMode('idle'),
+
+      // data
+      sessions, animOptions, colorOptions, toggles, idleOptions, stateButtons,
+
+      // controls
+      showControls: this.props.showControls ?? true,
+      toggleExpand: () => this.setState(st => ({ expanded: !st.expanded })),
+      expandLabel: s.expanded ? 'Collapse' : 'Expand',
+      expandBtnBg: s.expanded ? this.hexSoft(this.brand(), 0.9) : 'rgba(255,255,255,.06)',
+      expandBtnText: s.expanded ? '#1a1613' : '#e8e2d8',
+    };
+  }
+}
+</script>
+</body>
+</html>

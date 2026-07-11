@@ -28,8 +28,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Claude Status Bar</string>
   <key>CFBundleIdentifier</key><string>com.local.claudestatusbar</string>
   <key>CFBundleExecutable</key><string>ClaudeStatusBar</string>
-  <key>CFBundleVersion</key><string>0.3.4</string>
-  <key>CFBundleShortVersionString</key><string>0.3.4</string>
+  <key>CFBundleVersion</key><string>0.4.0</string>
+  <key>CFBundleShortVersionString</key><string>0.4.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <key>LSUIElement</key><true/>
@@ -42,6 +42,7 @@ PLIST
 mkdir -p "$APP/Contents/Resources"
 cp hooks/update.js hooks/lifecycle.js hooks/agents.js hooks/install.js hooks/uninstall.js "$APP/Contents/Resources/"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp assets/completion.mp3 "$APP/Contents/Resources/completion.mp3"
 
 # --- Signing / notarization ---
 # For a clean (no Gatekeeper warning) release you need, set up once on this Mac:
@@ -64,12 +65,17 @@ SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
 # carry — codesign rejects them ("resource fork, Finder information, ... not allowed").
 xattr -cr "$APP"
 
+# The apple-events entitlement is REQUIRED for iTerm exact-tab focus + permission Allow/Deny
+# keystroke: a hardened-runtime app can't send Apple Events (AppleScript) without it. tmux
+# keystrokes don't use Apple Events, so they work even without this entitlement/grant.
+ENTITLEMENTS="ClaudeStatusBar.entitlements"
+
 if [[ -n "$SIGN_ID" ]]; then
   echo "Signing with Developer ID: $SIGN_ID"
-  codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$APP"
+  codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP"
 else
   echo "No Developer ID cert for team $TEAM_ID found — ad-hoc signing (local dev build)."
-  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+  codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP" >/dev/null 2>&1 || true
 fi
 echo "Built $APP"
 

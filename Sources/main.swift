@@ -1,4 +1,5 @@
 import Cocoa
+import ApplicationServices  // AXIsProcessTrustedWithOptions (Accessibility check for keystroke posting)
 
 // Custom-drawn toggle. NSSwitch can't show its accent inside a menu (the menu's vibrant, non-key
 // window draws the implicit accent gray), so we render the track + knob as layers and fill the
@@ -348,10 +349,13 @@ final class StatusController: NSObject, NSMenuDelegate {
     var stalePruneAge: TimeInterval { UserDefaults.standard.object(forKey: "hideIdleAfter") as? Double ?? 900 }
 
     struct Session {
-        var id: String, state: String, label: String, project: String, transcript: String
+        var id: String, state: String, label: String, project: String, projectPath: String, transcript: String
         var cwd: String         // session working directory; "" on pre-upgrade files
+        var tool: String        // raw tool name from the hook (Bash, Edit, …); "" outside tool/permission
         var entrypoint: String  // CLAUDE_CODE_ENTRYPOINT: "cli", "claude-desktop", …
         var termProgram: String // TERM_PROGRAM for CLI sessions: "Apple_Terminal", "iTerm.app", …
+        var tty: String         // controlling tty (e.g. /dev/ttys003) for exact focus + permission keystroke
+        var tmux: Bool          // session runs inside tmux → keystrokes route via `tmux send-keys`
         var pid: Int32          // the session's `claude` process; kill(pid,0) drives liveness. 0 = pre-upgrade file.
         var started: Bool       // true once the session had real activity (a prompt/tool); a merely-opened
                                 // conversation seeds started=false and stays out of the dropdown.
@@ -365,10 +369,14 @@ final class StatusController: NSObject, NSMenuDelegate {
             self.state = o["state"] as? String ?? "idle"
             self.label = o["label"] as? String ?? ""
             self.project = o["project"] as? String ?? ""
+            self.projectPath = o["project_path"] as? String ?? ""
             self.transcript = o["transcript"] as? String ?? ""
             self.cwd = o["cwd"] as? String ?? ""
+            self.tool = o["tool"] as? String ?? ""
             self.entrypoint = o["entrypoint"] as? String ?? ""
             self.termProgram = o["term_program"] as? String ?? ""
+            self.tty = o["tty"] as? String ?? ""
+            self.tmux = o["tmux"] as? Bool ?? false
             self.pid = Int32(truncatingIfNeeded: (o["pid"] as? NSNumber)?.intValue ?? 0)
             self.started = o["started"] as? Bool ?? false
             self.startedAt = (o["startedAt"] as? NSNumber)?.doubleValue ?? 0
@@ -402,6 +410,8 @@ final class StatusController: NSObject, NSMenuDelegate {
     var agentDirMTimes: [String: Date] = [:]        // session id -> agents.d mtime last parsed
     var gitHeadCache: [String: String] = [:]  // cwd -> resolved HEAD path ("" = confirmed non-git)
     var prevState: [String: String] = [:]  // id -> previous raw state per session
+    var soundPrev: [String: String] = [:]  // id -> previous raw state (completion-sound / done-flash edge)
+    var turnStart: [String: Double] = [:]  // id -> active turn start (5-min sound gate, done-flash duration)
     var menuIsOpen = false                  // refresh the dropdown's per-session timers only while open
     var sessionMenuItems: [(item: NSMenuItem, id: String)] = []
     var agentMenuItems: [(item: NSMenuItem, sessionId: String, agentId: String)] = []
@@ -412,6 +422,8 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     let brand = NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1) // #d97757, Anthropic's official "Orange" accent
     let amber = NSColor(srgbRed: 0.95, green: 0.73, blue: 0.18, alpha: 1) // "awaiting permission" yellow dot
+    let islandGreen = NSColor(srgbRed: 0.31, green: 0.62, blue: 0.415, alpha: 1) // #4f9e6a, "done" state on the island
+    let islandGray = NSColor(srgbRed: 0.541, green: 0.522, blue: 0.486, alpha: 1) // #8a857c, "idle"/muted on the island
     let frames: [NSImage] = StatusController.loadFrames()
     let spriteFPS: Double = 9 // tune: 8 frames per loop -> ~0.9s/cycle
 
@@ -420,7 +432,44 @@ final class StatusController: NSObject, NSMenuDelegate {
     var showTimer = false
     var iconSystem = false // false = brand Orange; true = adaptive black/white (template image)
     var useThinkingWords = true     // rotate a playful verb ("Manifesting…") in place of "Thinking…"
+    var showAtNotch = true          // on a notched Mac, render at the notch and hide the menu bar item
+    var exactTerminalFocus = false  // experimental: iTerm exact-tab focus + Allow/Deny keystroke (AppleScript, one-time macOS Automation grant). tmux keystrokes need no grant and work regardless.
     var sessionWord: [String: String] = [:] // id -> current thinking word; re-picked on each entry into "thinking"
+
+    // Notch overlay. Present only on a notched Mac with "Show at notch" on; nil => the menu bar item
+    // is the surface (unchanged legacy path). The state pipeline never touches these — only the three
+    // render sinks branch on notchView (see setSinkImage / applyTitle).
+    let statusMenu = NSMenu()       // shared dropdown: attached to the status item OR popped at the notch
+    var notchWindow: NotchWindow?
+    var notchView: NotchContentView?
+    var notchGeo: NotchGeometry?
+    var notchScreen: NSScreen?      // the display the island is currently on (follows the cursor)
+    var activeDot = false           // last render's permission-dot flag, so resize/rebuild can redraw it
+    var stateAccent: NSColor?       // lead state's accent (amber/green/brand) — colors the pill timer + ping ring
+    var flashDone = false           // brief green "Done ✓" state after a turn ends (design's done flash)
+    var flashDoneDur = 0            // that finished turn's duration in seconds (0 = unknown)
+    let doneFlashSecs: Double = 4.2 // how long the done flash holds before settling to Idle
+    var doneInfo: [String: (at: Double, dur: Int)] = [:] // id -> last working→done edge (drives the flash)
+    var playCompletionSound = false // chime when a turn longer than ~5 min finishes
+    lazy var completionSound: NSSound? = {
+        guard let p = Bundle.main.path(forResource: "completion", ofType: "mp3"),
+              let s = NSSound(contentsOfFile: p, byReference: true) else { return nil }
+        s.volume = 0.7 // the clip is loud at full system volume; play it a bit softer
+        return s
+    }()
+    let notchDrop: CGFloat = 12     // expanded: gap between the notch and the dashboard body
+    let collapsedLip: CGFloat = 6   // collapsed: thin rounded lip below the menu-bar band (content flanks the notch, no big drop)
+    let notchContentPad: CGFloat = 12 // horizontal padding around the island's content row
+    let notchExpandedWidth: CGFloat = 404 // width of the expanded (hover) dashboard panel (compact design)
+    var notchCollapseWork: DispatchWorkItem? // pending collapse after the pointer leaves the island
+    var notchResting = true         // last render's idle flag; a synthetic (external) pill hides while resting
+    // Expanded dashboard state.
+    enum NotchPage { case dashboard, settings }
+    var notchPage: NotchPage = .dashboard
+    var leadSession: Session?               // the session the island currently surfaces (hero card)
+    weak var notchHeroIcon: NSImageView?    // big animated icon in the dashboard hero; animStep drives it
+    weak var notchHeroTimer: NSTextField?   // big elapsed clock in the hero; animStep keeps it live
+    weak var notchProgress: NotchProgressBar? // the working-shimmer bar in the hero
     // Claude Code's SPINNER_VERBS, minus the hyphenated/tongue-twister ones. Longest kept is ~14 chars
     // ("Hullaballooing"/"Metamorphosing"); with the timer showing they can get wide in a crowded menu bar.
     let thinkingWords = [
@@ -469,11 +518,12 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
     var frameCount: Int {
         switch animStyle {
-        case .web: return max(1, frames.count)
+        case .web: return sparkleFrameCount   // smooth rotation steps for the SF Symbol sparkle
         case .code: return codeGlyphs.count * codeSub
         case .crab: return max(1, crabFrames.count)
         }
     }
+    let sparkleFrameCount = 30
 
     override init() {
         super.init()
@@ -481,17 +531,932 @@ final class StatusController: NSObject, NSMenuDelegate {
         if d.object(forKey: "showTimer") != nil { showTimer = d.bool(forKey: "showTimer") }
         if d.object(forKey: "iconSystem") != nil { iconSystem = d.bool(forKey: "iconSystem") }
         if d.object(forKey: "thinkingWords") != nil { useThinkingWords = d.bool(forKey: "thinkingWords") }
+        if d.object(forKey: "completionSound") != nil { playCompletionSound = d.bool(forKey: "completionSound") }
+        if d.object(forKey: "showAtNotch") != nil { showAtNotch = d.bool(forKey: "showAtNotch") }
+        if d.object(forKey: "exactTerminalFocus") != nil { exactTerminalFocus = d.bool(forKey: "exactTerminalFocus") }
         if let s = d.string(forKey: "animStyle"), let st = AnimStyle(rawValue: s) { animStyle = st }
-        let menu = NSMenu()
-        menu.delegate = self
-        statusItem.menu = menu
+        statusMenu.delegate = self
+        setupNotch()   // builds the notch window (and hides the status item) when a notch is present
         render(label: "", color: iconColor, animate: false, startedAt: 0)
         let t = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in self?.tick() }
         RunLoop.main.add(t, forMode: .common)
         pollTimer = t
+        // A notch can appear/vanish at runtime (dock/undock, lid open/close) — rebuild on change.
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil)
         tick()
         ensureHooksInstalled()
         checkForUpdate()
+    }
+
+    // MARK: notch overlay
+
+    // Idempotent: build or tear down the notch window to match (notch present? && showAtNotch), and
+    // flip the status item so exactly one surface is visible. Called from init, the toggle, and on
+    // screen reconfiguration.
+    func setupNotch() {
+        // Once we've ever seen a physical notch, remember it — a docked-clamshell MacBook has no
+        // notch screen attached yet still wants the island (on its external).
+        if NotchGeometry.machineHasNotch() { UserDefaults.standard.set(true, forKey: "machineHasNotch") }
+        let enabled = showAtNotch && UserDefaults.standard.bool(forKey: "machineHasNotch")
+        if enabled {
+            let screen = activeScreen()
+            let geo = NotchGeometry.forScreen(screen)
+            notchGeo = geo
+            notchScreen = screen
+            // Start at bare-notch width; resizeNotchToFit() grows the flanks when a turn is active.
+            let band = geo.menuBarHeight > 0 ? geo.menuBarHeight : 30
+            let frame = NSRect(x: geo.centerX - max(geo.notchRect.width, 1) / 2, y: geo.topY - (band + collapsedLip),
+                               width: max(geo.notchRect.width, 1), height: band + collapsedLip)
+            let win = notchWindow ?? NotchWindow(contentRect: frame)
+            win.setFrame(frame, display: true)
+            let view = notchView ?? NotchContentView(frame: NSRect(origin: .zero, size: frame.size),
+                                                     notchWidth: geo.notchRect.width, menuBarHeight: geo.menuBarHeight)
+            view.frame = NSRect(origin: .zero, size: frame.size)
+            view.notchWidth = geo.notchRect.width
+            view.menuBarHeight = geo.menuBarHeight
+            view.synthetic = geo.synthetic
+            view.timerField.textColor = brand   // the live clock in the pill pops brand orange
+            view.onHoverEnter = { [weak self] in self?.notchHoverEnter() }
+            view.onHoverExit = { [weak self] in self?.notchHoverExit() }
+            win.contentView = view
+            notchWindow = win
+            notchView = view
+            win.orderFrontRegardless()   // the pill stays visible so it's always hoverable
+            statusItem.menu = nil
+            statusItem.isVisible = false
+            resizeNotchToFit()           // fit the current header content on the (re)built pill
+            notchDbg("notch active on \(screen.frame) synthetic=\(geo.synthetic)")
+        } else {
+            notchWindow?.orderOut(nil)
+            notchWindow = nil
+            notchView = nil
+            notchGeo = nil
+            notchScreen = nil
+            statusItem.isVisible = true
+            statusItem.menu = statusMenu
+            notchDbg("notch inactive, using menu bar item")
+        }
+        // Repaint the current state into whichever sink is now active.
+        evaluate()
+    }
+
+    // The screen the user is currently on = the one under the mouse cursor. Falls back to main.
+    func activeScreen() -> NSScreen {
+        let p = NSEvent.mouseLocation
+        return NSScreen.screens.first { $0.frame.contains(p) } ?? NSScreen.main ?? NSScreen.screens.first!
+    }
+
+    // Collapsed window frame: content flanks the notch in the menu-bar band (split design), so height
+    // is just the band + a thin lip — no big drop. Width = the two symmetric flanks + the notch, or the
+    // bare notch when idle. Centered on the notch.
+    func collapsedFrame(_ geo: NotchGeometry, _ view: NotchContentView) -> NSRect {
+        let band = geo.menuBarHeight > 0 ? geo.menuBarHeight : 30
+        let panelH = band + collapsedLip
+        let dcw = view.desiredContentWidth()
+        let panelW = dcw <= 0 ? max(geo.notchRect.width, 1) : dcw + 2 * NotchContentView.sidePad
+        return NSRect(x: geo.centerX - panelW / 2, y: geo.topY - panelH, width: panelW, height: panelH)
+    }
+
+    // Called every tick: if the cursor moved to a different display, move the island onto it,
+    // reconfiguring real-notch vs synthetic-pill for that screen. Cheap when nothing changed.
+    func updateActiveNotchScreen() {
+        guard let win = notchWindow, let view = notchView else { return }
+        let screen = activeScreen()
+        if screen == notchScreen { return }
+        if view.expanded { collapseNotch() }
+        let geo = NotchGeometry.forScreen(screen)
+        notchGeo = geo
+        notchScreen = screen
+        view.notchWidth = geo.notchRect.width
+        view.menuBarHeight = geo.menuBarHeight
+        view.synthetic = geo.synthetic
+        win.setFrame(collapsedFrame(geo, view), display: true)
+        view.needsLayout = true
+        applyNotchVisibility()   // moving onto an external (synthetic) screen must not re-show an idle pill
+        notchDbg("repositioned to \(screen.frame) synthetic=\(geo.synthetic)")
+    }
+
+    // Grow/shrink the collapsed pill to hug the current header content, keeping it centered on the
+    // notch and never narrower than the notch itself (so the top always fuses with the cutout). No-op
+    // while expanded — the expanded frame is owned by expandNotch().
+    func resizeNotchToFit() {
+        guard let geo = notchGeo, let win = notchWindow, let view = notchView, !view.expanded else { return }
+        let frame = collapsedFrame(geo, view)
+        if abs(frame.width - win.frame.width) > 0.5 { win.setFrame(frame, display: true) }
+        view.needsLayout = true
+    }
+
+    // MARK: notch expand / collapse (hover)
+
+    // Hover is driven by a mouse-LOCATION poll, not raw enter/exit events. The small collapsed pill
+    // (whose width also jitters while a turn animates) produced constant enter/exit right at its edge,
+    // toggling expand/collapse. Instead: expand on a genuine enter, then poll the real cursor position
+    // and collapse only once it has truly left the current (large, when expanded) window frame. The big
+    // expanded frame gives wide hysteresis, so edge jitter can't flip it.
+    func notchHoverEnter() {
+        guard let win = notchWindow, let view = notchView else { return }
+        guard win.frame.contains(NSEvent.mouseLocation) else { return }   // ignore stray enters
+        if !view.expanded { notchPage = .dashboard; expandNotch() }        // fresh open → dashboard
+        startNotchHoverPoll()
+    }
+    func notchHoverExit() { startNotchHoverPoll() }
+
+    private func startNotchHoverPoll() {
+        notchCollapseWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.notchHoverPoll() }
+        notchCollapseWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+    }
+    private func notchHoverPoll() {
+        guard let win = notchWindow, let view = notchView, view.expanded else { notchCollapseWork = nil; return }
+        if win.frame.contains(NSEvent.mouseLocation) {
+            startNotchHoverPoll()          // still inside the panel → keep it open, keep watching
+        } else {
+            notchCollapseWork = nil
+            collapseNotch()                // pointer genuinely left → collapse
+        }
+    }
+
+    func expandNotch(animated: Bool = true) {
+        guard let geo = notchGeo, let win = notchWindow, let view = notchView else { return }
+        let bodyH = populateNotchBody()
+        view.setExpanded(true, bodyHeight: bodyH)
+        let w = notchExpandedWidth
+        let h = geo.menuBarHeight + notchDrop + bodyH + 2 * NotchContentView.bodyInset
+        let frame = NSRect(x: geo.centerX - w / 2, y: geo.topY - h, width: w, height: h)
+        guard animated else { win.setFrame(frame, display: true); view.needsLayout = true; return }
+        view.body.alphaValue = 0
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.34
+            // Slight overshoot on the trailing control point → a soft spring, like boring.notch.
+            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.9, 0.28, 1.06)
+            ctx.allowsImplicitAnimation = true
+            win.animator().setFrame(frame, display: true)
+            view.body.animator().alphaValue = 1   // content fades in as the panel drops
+        }, completionHandler: { [weak self] in
+            // Pin the exact target frame — the animator can settle a hair off after the overshoot,
+            // which would leave the wide content clipped by a slightly-narrow window.
+            guard let self = self, self.notchView?.expanded == true else { return }
+            win.setFrame(frame, display: true)
+            notchDbg("expanded settled at \(win.frame), target=\(frame), bodyH=\(bodyH)")
+        })
+        notchDbg("expanding to \(frame), bodyH=\(bodyH)")
+    }
+
+    func collapseNotch() {
+        guard let geo = notchGeo, let win = notchWindow, let view = notchView, view.expanded else { return }
+        let panelW = max(geo.notchRect.width, view.desiredContentWidth() + 2 * notchContentPad)
+        let panelH = geo.menuBarHeight + notchDrop
+        let frame = NSRect(x: geo.centerX - panelW / 2, y: geo.topY - panelH, width: panelW, height: panelH)
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.24
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            win.animator().setFrame(frame, display: true)
+            view.body.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            // Tear down the rows only after the fade, so nothing pops out mid-collapse.
+            self?.notchView?.setExpanded(false, bodyHeight: 0)
+            self?.notchView?.body.subviews.forEach { $0.removeFromSuperview() }
+            self?.notchView?.body.alphaValue = 1
+            self?.notchHeroIcon = nil
+            self?.notchHeroTimer = nil
+            self?.notchProgress = nil
+            self?.notchPage = .dashboard   // always reopen on the dashboard
+        })
+        notchDbg("collapsed to \(frame)")
+    }
+
+    // Rebuild the expanded body in place (after a setting toggles). No fade/resize animation, so
+    // flipping a switch just updates the list under the pointer without a flash.
+    func refreshNotchExpanded() {
+        guard let view = notchView, view.expanded else { return }
+        expandNotch(animated: false)
+    }
+
+    // MARK: notch expanded body (dashboard / settings)
+
+    // Build the expanded panel into view.body: a top toolbar plus the current page (dashboard or
+    // settings). Returns the total height. Stacked with the body origin at bottom-left.
+    func populateNotchBody() -> CGFloat {
+        guard let view = notchView else { return 0 }
+        view.body.subviews.forEach { $0.removeFromSuperview() }
+        // CRITICAL: the body is still at the collapsed width when we build into it (expandNotch grows
+        // the window AFTER this returns). AppKit autoresizing is delta-based, so letting the body
+        // resize its children when it later jumps to full width would shove every right-anchored
+        // (.minXMargin) subview off-screen by that delta. We lay out at the fixed expanded width and
+        // forbid the body from touching child frames on resize.
+        view.body.autoresizesSubviews = false
+        let innerW = notchExpandedWidth - 2 * NotchContentView.bodyInset
+
+        let toolbar = islandToolbar(width: innerW)
+        let page = (notchPage == .settings) ? buildSettingsPage(width: innerW) : buildDashboard(width: innerW)
+        let gap: CGFloat = 4
+        let total = toolbar.frame.height + gap + page.frame.height
+
+        page.frame = NSRect(x: 0, y: 0, width: innerW, height: page.frame.height)
+        toolbar.frame = NSRect(x: 0, y: total - toolbar.frame.height, width: innerW, height: toolbar.frame.height)
+        page.autoresizingMask = [.width]; toolbar.autoresizingMask = [.width]
+        view.body.addSubview(page)
+        view.body.addSubview(toolbar)
+        return total
+    }
+
+    // Top bar (design's header row): dashboard → serif "Claude" wordmark + "STATUS", right "N active"
+    // chip + boxed gear; settings → back chevron + "Settings". A hairline separates it from the page.
+    func islandToolbar(width: CGFloat) -> NSView {
+        let h: CGFloat = 36, cy: CGFloat = (h - 1) / 2 + 1   // content centered above the hairline
+        let bar = NSView(frame: NSRect(x: 0, y: 0, width: width, height: h))
+        let sep = NSView(frame: NSRect(x: 2, y: 0, width: width - 4, height: 1))
+        sep.wantsLayer = true
+        sep.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+        sep.autoresizingMask = [.width]
+        bar.addSubview(sep)
+
+        if notchPage == .settings {
+            let back = islandIconButton("chevron.left") { [weak self] in self?.showNotchDashboard() }
+            back.frame = NSRect(x: 2, y: cy - 11, width: 26, height: 22)
+            bar.addSubview(back)
+            let title = islandLabel("Settings", size: 14, weight: .medium, color: .white)
+            title.frame = NSRect(x: 32, y: cy - 8, width: width - 64, height: 17)
+            bar.addSubview(title)
+            return bar
+        }
+
+        // "Claude" in a serif face (New York ≈ the design's Newsreader) + a letterspaced "STATUS".
+        let wordmark = NSTextField(labelWithString: "Claude")
+        let serif: NSFont = {
+            let base = NSFont.systemFont(ofSize: 18, weight: .medium)
+            if let d = base.fontDescriptor.withDesign(.serif), let f = NSFont(descriptor: d, size: 18) { return f }
+            return base
+        }()
+        wordmark.font = serif
+        wordmark.textColor = NSColor(srgbRed: 0.98, green: 0.97, blue: 0.95, alpha: 1)
+        let ww = ceil(("Claude" as NSString).size(withAttributes: [.font: serif]).width) + 6
+        wordmark.frame = NSRect(x: 4, y: cy - 12, width: ww, height: 24)
+        bar.addSubview(wordmark)
+        let status = NSTextField(labelWithString: "")
+        status.attributedStringValue = NSAttributedString(string: "STATUS", attributes: [
+            .font: NSFont.systemFont(ofSize: 9.5, weight: .semibold),
+            .kern: 1.6,
+            .foregroundColor: islandGray,
+        ])
+        status.frame = NSRect(x: 4 + ww + 6, y: cy - 8, width: 70, height: 13)
+        bar.addSubview(status)
+
+        // Boxed sliders button (design: 28×28 rounded square) — right edge.
+        let gear = islandIconButton("slider.horizontal.3", boxed: true) { [weak self] in self?.showNotchSettings() }
+        gear.frame = NSRect(x: width - 2 - 28, y: cy - 14, width: 28, height: 28)
+        gear.autoresizingMask = [.minXMargin]
+        bar.addSubview(gear)
+
+        // "N active" count pill just before the gear.
+        let now = Date().timeIntervalSince1970
+        let n = sessions.values.filter { s in
+            let eff = s.eff.isEmpty ? effectiveState(s, now: now) : s.eff
+            return eff == "thinking" || eff == "tool" || eff == "permission"
+        }.count
+        let chipLabel = islandLabel("\(n) active", size: 11, weight: .semibold, color: NSColor(white: 1, alpha: 0.7))
+        let lw = ceil(("\(n) active" as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]).width) + 4
+        let chipW = lw + 18, chipH: CGFloat = 21
+        let chip = NSView(frame: NSRect(x: width - 2 - 28 - 8 - chipW, y: cy - chipH / 2, width: chipW, height: chipH))
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = NSColor(white: 1, alpha: 0.07).cgColor
+        chip.layer?.cornerRadius = chipH / 2
+        chip.autoresizingMask = [.minXMargin]
+        chipLabel.frame = NSRect(x: 9, y: (chipH - 14) / 2, width: lw, height: 14)
+        chip.addSubview(chipLabel)
+        bar.addSubview(chip)
+        return bar
+    }
+
+    // Design's state accent: amber while a permission waits, green on done, dim gray at rest,
+    // brand orange while working/thinking. Drives the session-row status dot on the island.
+    func islandStateColor(_ eff: String, state: String) -> NSColor {
+        switch eff {
+        case "permission":       return amber
+        case "thinking", "tool": return brand
+        default:                 return state == "done" ? islandGreen : islandGray
+        }
+    }
+
+    // ── Icon design system ────────────────────────────────────────────────────────
+    // One SF Symbol config for the whole panel so every glyph shares a family/weight — a lightweight,
+    // dependency-free icon system (SF Symbols is the native "library"). Returns a TEMPLATE image; the
+    // caller sets contentTintColor. (Palette-colored symbol configs can render empty inside a non-key
+    // borderless panel, so template + tint is the reliable path here.)
+    func panelIcon(_ symbol: String, size: CGFloat = 13, weight: NSFont.Weight = .semibold) -> NSImage? {
+        let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: weight)
+        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
+        img?.isTemplate = true
+        return img
+    }
+
+    func islandIconButton(_ symbol: String, boxed: Bool = false, action: @escaping () -> Void) -> IslandRow {
+        let w: CGFloat = boxed ? 28 : 26, h: CGFloat = boxed ? 28 : 22
+        let btn = IslandRow(height: h)
+        btn.frame = NSRect(x: 0, y: 0, width: w, height: h)
+        if boxed {   // design's 28×28 rounded-square button chrome
+            btn.layer?.backgroundColor = NSColor(white: 1, alpha: 0.06).cgColor
+            btn.layer?.cornerRadius = 8
+        }
+        let iv = NSImageView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        iv.image = panelIcon(symbol)   // central icon config → template glyph
+        iv.contentTintColor = NSColor(white: 1, alpha: 0.85)
+        iv.imageScaling = .scaleProportionallyUpOrDown
+        btn.addSubview(iv)
+        btn.onClick = action
+        return btn
+    }
+
+    func showNotchSettings() { notchPage = .settings; expandNotch(animated: false) }
+    func showNotchDashboard() { notchPage = .dashboard; expandNotch(animated: false) }
+
+    // Dashboard = a single vertical column (matches the design): full-width hero card on top,
+    // then a "SESSIONS" header over a card of clickable session rows.
+    func buildDashboard(width: CGFloat) -> NSView {
+        let now = Date().timeIntervalSince1970
+        let hero = islandHeroCard(width: width)
+        let all = notchVisibleSessions(now: now)
+        let shown = Array(all.prefix(5))
+        let header = islandSectionHeader("Sessions", width: width)
+        let rows: [NSView] = shown.map { s in
+            let eff = s.eff.isEmpty ? effectiveState(s, now: now) : s.eff
+            return islandSessionRow(s, eff: eff, width: width)
+        }
+        // Design: bare rows with a 2px gap (hover/lead highlight per row) — no grouped card.
+        let rowGap: CGFloat = 2
+        let listH = rows.reduce(0) { $0 + $1.frame.height } + rowGap * CGFloat(max(0, rows.count - 1))
+        let list = NSView(frame: NSRect(x: 0, y: 0, width: width, height: listH))
+        var ly = listH
+        for r in rows {
+            ly -= r.frame.height
+            r.frame = NSRect(x: 0, y: ly, width: width, height: r.frame.height)
+            r.autoresizingMask = [.width]
+            list.addSubview(r)
+            ly -= rowGap
+        }
+        if all.count > shown.count { notchDbg("sessions list hid \(all.count - shown.count) rows") }
+
+        let gHero: CGFloat = 10, gHdr: CGFloat = 4
+        let total = hero.frame.height + gHero + header.frame.height + gHdr + list.frame.height
+        let c = NSView(frame: NSRect(x: 0, y: 0, width: width, height: total))
+        var y = total
+        for (v, before): (NSView, CGFloat) in [(hero, 0), (header, gHero), (list, gHdr)] {
+            y -= before + v.frame.height
+            v.frame = NSRect(x: 0, y: y, width: width, height: v.frame.height)
+            v.autoresizingMask = [.width]
+            c.addSubview(v)
+        }
+        return c
+    }
+
+    // Full-width hero: accent-soft icon tile + name/project, right-aligned status + big timer,
+    // optional "$ tool" chip, working shimmer, and a jump-to-session button. Stacked top→down.
+    func islandHeroCard(width: CGFloat) -> NSView {
+        let now = Date().timeIntervalSince1970
+        let lead = leadSession
+        let eff = lead.map { $0.eff.isEmpty ? effectiveState($0, now: now) : $0.eff } ?? "idle"
+        let working = (eff == "thinking" || eff == "tool")
+        let doneNow = flashDone && lead != nil          // green "Done ✓" flash mirrors the pill
+        let toolText = lead?.tool ?? ""
+        let hasChip = (eff == "tool" || eff == "permission") && !toolText.isEmpty
+        let hasJump = lead != nil
+        // Allow/Deny keystroke row: only when a permission is waiting AND we can reliably target the
+        // session's prompt (tmux pane, or iTerm with the grant on). Otherwise the buttons are hidden.
+        let hasPermActions = eff == "permission" && (lead.map(canSendPermissionKey) ?? false)
+
+        let accent: NSColor = eff == "permission" ? amber
+                            : doneNow ? islandGreen
+                            : working ? brand
+                            : NSColor(white: 1, alpha: 0.35)
+        let hasProgress = (eff == "tool")   // running command → shimmer (design: working only)
+
+        // Block heights (compact design): a 34px top row, then optional progress / tool chip / jump link.
+        let pad: CGFloat = 12, topRow: CGFloat = 34
+        let progBlk: CGFloat = hasProgress ? 11 + 3 : 0
+        let chipBlk: CGFloat = hasChip ? 11 + 30 : 0
+        let permBlk: CGFloat = hasPermActions ? 10 + 32 : 0   // Allow/Deny button row
+        let jumpBlk: CGFloat = hasJump ? 9 + 16 : 0
+        let h = pad + topRow + progBlk + chipBlk + permBlk + jumpBlk + pad
+        let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: h))
+        card.wantsLayer = true
+        card.layer?.backgroundColor = accent.withAlphaComponent(0.11).cgColor  // accent-soft wash (design)
+        card.layer?.cornerRadius = 14
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor(white: 1, alpha: 0.08).cgColor
+        card.layer?.masksToBounds = true
+        // Top accent hairline across the card (design's glowing edge).
+        let hair = CAGradientLayer()
+        hair.frame = NSRect(x: 0, y: h - 1, width: width, height: 1)
+        hair.startPoint = CGPoint(x: 0, y: 0.5); hair.endPoint = CGPoint(x: 1, y: 0.5)
+        hair.colors = [NSColor.clear.cgColor, accent.withAlphaComponent(0.6).cgColor, NSColor.clear.cgColor]
+        hair.autoresizingMask = [.layerWidthSizable, .layerMinYMargin]
+        card.layer?.addSublayer(hair)
+
+        var y = h - pad   // running cursor at the TOP of the content box, moving down
+
+        // ── top row: dark icon tile + [name … timer] over [status · path] ──────────
+        let tileD: CGFloat = 34
+        let tile = NSView(frame: NSRect(x: pad, y: y - tileD, width: tileD, height: tileD))
+        tile.wantsLayer = true
+        tile.layer?.backgroundColor = NSColor(white: 0, alpha: 0.28).cgColor   // dark well (design)
+        tile.layer?.cornerRadius = 10
+        tile.layer?.borderWidth = 1
+        tile.layer?.borderColor = NSColor(white: 1, alpha: 0.05).cgColor
+        tile.layer?.masksToBounds = true
+        let iconD: CGFloat = 24
+        let icon = NSImageView(frame: NSRect(x: (tileD - iconD) / 2, y: (tileD - iconD) / 2, width: iconD, height: iconD))
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        icon.contentTintColor = .white
+        if working { icon.image = iconImage(color: nil, frame: frameIdx); notchHeroIcon = icon }
+        else if eff == "permission" { icon.image = restingIcon(color: amber) }
+        else if doneNow { icon.image = doneIcon() }
+        else { icon.image = restingIcon(color: nil) }
+        // Soft accent halo behind the icon while active (design: diffuse pulsing glow, not a hard ring).
+        if working || eff == "permission" {
+            let haloD: CGFloat = 26
+            let halo = CALayer()
+            halo.frame = NSRect(x: (tileD - haloD) / 2, y: (tileD - haloD) / 2, width: haloD, height: haloD)
+            halo.cornerRadius = haloD / 2
+            halo.backgroundColor = accent.withAlphaComponent(0.5).cgColor
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 0.3; pulse.toValue = 0.75
+            pulse.duration = 1.15; pulse.autoreverses = true; pulse.repeatCount = .infinity
+            halo.add(pulse, forKey: "halo")
+            tile.layer?.insertSublayer(halo, at: 0)
+        }
+        tile.addSubview(icon)
+        card.addSubview(tile)
+
+        let cx: CGFloat = pad + tileD + 12   // content column left edge
+        // Timer text: turn while working, wait while a permission sits, duration on done.
+        var timerText = ""
+        if working, let st = lead?.startedAt, st > 0 { timerText = elapsed(max(0, Int(now - st))) }
+        else if eff == "permission", let ts = lead?.ts { timerText = elapsed(max(0, Int(now - ts))) }
+        else if doneNow, flashDoneDur > 0 { timerText = elapsed(flashDoneDur) }
+
+        // Row A: big timer pinned right, name fills the rest (truncating against it).
+        var nameRight = width - pad
+        if !timerText.isEmpty {
+            let tw: CGFloat = 92
+            let t = islandLabel(timerText, size: 17, weight: .semibold, color: NSColor(srgbRed: 0.98, green: 0.97, blue: 0.95, alpha: 1), mono: true)
+            t.alignment = .right
+            t.frame = NSRect(x: width - pad - tw, y: y - 20, width: tw, height: 20)
+            t.autoresizingMask = [.minXMargin]
+            card.addSubview(t)
+            notchHeroTimer = t
+            nameRight = width - pad - tw - 8
+        }
+        let name = islandLabel(lead.map(sessionName) ?? "Idle", size: 14, weight: .semibold, color: NSColor(srgbRed: 0.98, green: 0.97, blue: 0.95, alpha: 1))
+        name.frame = NSRect(x: cx, y: y - 18, width: max(20, nameRight - cx), height: 17)
+        name.autoresizingMask = [.width]; card.addSubview(name)
+
+        // Row B: status (accent) · path (mono gray), inline with a middot separator.
+        let statusStr = doneNow ? "Done" : (lead.map { statusText($0, eff: eff) } ?? "Waiting for a session")
+        let stFont = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        let stw = ceil((statusStr as NSString).size(withAttributes: [.font: stFont]).width) + 8
+        let status = islandLabel(statusStr, size: 11.5, weight: .semibold,
+                                 color: (working || eff == "permission" || doneNow) ? accent : NSColor(white: 1, alpha: 0.55))
+        status.frame = NSRect(x: cx, y: y - 34, width: stw, height: 14); card.addSubview(status)
+        var sub = lead?.projectPath ?? ""
+        if sub.isEmpty, let l = lead {
+            sub = surfaceTag(l.entrypoint) == "APP" ? "Claude Desktop" : l.termProgram
+        }
+        if !sub.isEmpty {
+            let dotX = cx + stw + 6
+            let midDot = NSView(frame: NSRect(x: dotX, y: y - 34 + 6, width: 3, height: 3))
+            midDot.wantsLayer = true
+            midDot.layer?.backgroundColor = NSColor(white: 0.42, alpha: 1).cgColor
+            midDot.layer?.cornerRadius = 1.5
+            card.addSubview(midDot)
+            let projX = dotX + 3 + 6
+            let proj = islandLabel(sub, size: 11, weight: .regular, color: NSColor(srgbRed: 0.541, green: 0.518, blue: 0.482, alpha: 1), mono: true)
+            proj.frame = NSRect(x: projX, y: y - 34, width: max(10, width - pad - projX), height: 14)
+            proj.autoresizingMask = [.width]; card.addSubview(proj)
+        }
+        y -= topRow
+
+        // ── working shimmer (design: before the tool chip) ─────────────────────────
+        if hasProgress {
+            y -= 11
+            let prog = NotchProgressBar(frame: NSRect(x: pad, y: y - 3, width: width - 2 * pad, height: 3))
+            prog.autoresizingMask = [.width]
+            prog.setActive(true, color: brand)
+            card.addSubview(prog); notchProgress = prog
+            y -= 3
+        }
+
+        // ── tool chip ("$ npm run …") ─────────────────────────────────────────────
+        if hasChip {
+            y -= 11
+            let chip = NSView(frame: NSRect(x: pad, y: y - 30, width: width - 2 * pad, height: 30))
+            chip.wantsLayer = true
+            chip.layer?.backgroundColor = NSColor(white: 0, alpha: 0.36).cgColor
+            chip.layer?.cornerRadius = 9
+            chip.layer?.borderWidth = 1
+            chip.layer?.borderColor = NSColor(white: 1, alpha: 0.06).cgColor
+            chip.autoresizingMask = [.width]
+            let dollar = islandLabel("$", size: 11.5, weight: .bold, color: NSColor(srgbRed: 0.91, green: 0.65, blue: 0.18, alpha: 1), mono: true)
+            dollar.frame = NSRect(x: 11, y: 8, width: 10, height: 15); chip.addSubview(dollar)
+            let cmd = islandLabel(toolText, size: 11.5, weight: .regular, color: NSColor(white: 0.9, alpha: 1), mono: true)
+            cmd.frame = NSRect(x: 25, y: 8, width: width - 2 * pad - 36, height: 15); cmd.autoresizingMask = [.width]; chip.addSubview(cmd)
+            card.addSubview(chip)
+            y -= 30
+        }
+
+        // ── Allow / Deny keystroke buttons (permission only, when we can target the prompt) ──
+        if hasPermActions, let lead = lead {
+            y -= 10
+            let rowH: CGFloat = 32
+            let gap: CGFloat = 8
+            let btnW = (width - 2 * pad - gap) / 2
+            let denyBtn = islandPermButton("Deny", filled: false, accent: NSColor(srgbRed: 0.86, green: 0.35, blue: 0.32, alpha: 1),
+                                           frame: NSRect(x: pad, y: y - rowH, width: btnW, height: rowH)) { [weak self] in
+                self?.answerPermission(lead, .deny)
+            }
+            let allowBtn = islandPermButton("Allow", filled: true, accent: islandGreen,
+                                            frame: NSRect(x: pad + btnW + gap, y: y - rowH, width: btnW, height: rowH)) { [weak self] in
+                self?.answerPermission(lead, .allow)
+            }
+            denyBtn.autoresizingMask = [.width]
+            allowBtn.autoresizingMask = [.width, .minXMargin]
+            card.addSubview(denyBtn); card.addSubview(allowBtn)
+            y -= rowH
+        }
+
+        // ── jump to session (subtle right-aligned text link, design) ───────────────
+        if let lead = lead {
+            y -= 9
+            let jText = "Jump to session"
+            let jFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+            let jlw = ceil((jText as NSString).size(withAttributes: [.font: jFont]).width) + 8
+            let arrowD: CGFloat = 12, jgap: CGFloat = 5
+            let groupW = jlw + jgap + arrowD
+            let jx = width - pad - groupW
+            let jump = IslandRow(height: 16)
+            jump.frame = NSRect(x: jx - 6, y: y - 16, width: groupW + 12, height: 16)
+            jump.autoresizingMask = [.minXMargin]
+            let linkColor = NSColor(srgbRed: 0.761, green: 0.733, blue: 0.694, alpha: 1)
+            let jl = islandLabel(jText, size: 12, weight: .medium, color: linkColor)
+            jl.frame = NSRect(x: 6, y: 0, width: jlw, height: 15); jump.addSubview(jl)
+            let arrow = NSImageView(frame: NSRect(x: 6 + jlw + jgap, y: (16 - arrowD) / 2, width: arrowD, height: arrowD))
+            arrow.image = panelIcon("arrow.right", size: 11, weight: .semibold)
+            arrow.contentTintColor = linkColor
+            arrow.imageScaling = .scaleProportionallyUpOrDown
+            jump.addSubview(arrow)
+            let sid = lead.id, ep = lead.entrypoint, tp = lead.termProgram, tt = lead.tty, tx = lead.tmux
+            jump.onClick = { [weak self] in self?.collapseNotch(); self?.openSession(sid, entrypoint: ep, termProgram: tp, tty: tt, tmux: tx) }
+            card.addSubview(jump)
+        }
+        return card
+    }
+
+    // A permission Allow/Deny button: a filled accent pill (Allow) or an outlined one (Deny), with a
+    // centered label. Reuses IslandRow for the hover highlight + click.
+    func islandPermButton(_ title: String, filled: Bool, accent: NSColor, frame: NSRect, action: @escaping () -> Void) -> IslandRow {
+        let btn = IslandRow(height: frame.height)
+        btn.frame = frame
+        btn.wantsLayer = true
+        btn.layer?.cornerRadius = 9
+        btn.layer?.borderWidth = 1
+        if filled {
+            btn.layer?.backgroundColor = accent.withAlphaComponent(0.22).cgColor
+            btn.layer?.borderColor = accent.withAlphaComponent(0.55).cgColor
+        } else {
+            btn.layer?.backgroundColor = NSColor(white: 1, alpha: 0.04).cgColor
+            btn.layer?.borderColor = accent.withAlphaComponent(0.45).cgColor
+        }
+        let labelColor = filled ? accent.blended(withFraction: 0.35, of: .white) ?? accent : accent
+        let lbl = islandLabel(title, size: 12.5, weight: .semibold, color: labelColor)
+        lbl.alignment = .center
+        lbl.frame = NSRect(x: 0, y: (frame.height - 15) / 2, width: frame.width, height: 15)
+        lbl.autoresizingMask = [.width]
+        btn.addSubview(lbl)
+        btn.onClick = action
+        return btn
+    }
+
+    // Answer the waiting permission by delivering the keystroke, then collapse the notch so focus
+    // returns to the session. Guarded by canSendPermissionKey (buttons only render when we can send).
+    func answerPermission(_ s: Session, _ answer: PermAnswer) {
+        switch sendPermissionKey(s, answer) {
+        case .sent:
+            collapseNotch()          // let the user see the result in their terminal
+        case .denied:
+            handleGrantDenied()      // iTerm Automation grant declined → turn the toggle off
+            collapseNotch()
+        case .unsupported:
+            // Shouldn't happen (buttons gated by canSendPermissionKey), but fall back to focusing.
+            openSession(s.id, entrypoint: s.entrypoint, termProgram: s.termProgram, tty: s.tty, tmux: s.tmux)
+        }
+    }
+
+    // Compact settings (new design): a grouped "Icon style / Accent" card, a grouped toggles card,
+    // a Hide-idle segmented control, then update/quit and a centered version footer.
+    func buildSettingsPage(width: CGFloat) -> NSView {
+        var blocks: [(view: NSView, gapBefore: CGFloat)] = []
+        func add(_ v: NSView, gap: CGFloat) { blocks.append((v, gap)) }
+
+        add(settingsCard([iconStyleRow(width: width), accentRow(width: width)], width: width), gap: 0)
+
+        let toggles: [(String, Bool, (Bool) -> Void)] = [
+            ("Show elapsed timer", showTimer, { [weak self] on in
+                self?.showTimer = on; UserDefaults.standard.set(on, forKey: "showTimer"); self?.applyTitle() }),
+            ("Completion sound", playCompletionSound, { [weak self] on in
+                self?.playCompletionSound = on; UserDefaults.standard.set(on, forKey: "completionSound") }),
+            ("Playful thinking words", useThinkingWords, { [weak self] on in
+                self?.useThinkingWords = on; UserDefaults.standard.set(on, forKey: "thinkingWords"); self?.evaluate() }),
+            ("Live at the notch", showAtNotch, { [weak self] on in
+                self?.showAtNotch = on; UserDefaults.standard.set(on, forKey: "showAtNotch"); self?.setupNotch() }),
+        ]
+        add(settingsCard(toggles.map { toggleRowCompact($0.0, isOn: $0.1, width: width, onToggle: $0.2) }, width: width), gap: 10)
+
+        let hideLabel = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 14))
+        let hl = islandLabel("Hide idle sessions after", size: 11, weight: .semibold, color: islandGray)
+        hl.frame = NSRect(x: 2, y: 0, width: width - 4, height: 13); hl.autoresizingMask = [.width]; hideLabel.addSubview(hl)
+        add(hideLabel, gap: 13)
+        let hideVals: [Double] = [0, 300, 900, 1800, 3600]
+        let seg = IslandSegmented(items: ["Never", "5m", "15m", "30m", "1h"],
+                                  selected: hideVals.firstIndex(of: stalePruneAge) ?? 3, height: 30, brand: brand)
+        seg.frame = NSRect(x: 0, y: 0, width: width, height: 30)
+        seg.onSelect = { i in UserDefaults.standard.set(hideVals[i], forKey: "hideIdleAfter") }
+        add(seg, gap: 6)
+
+        let hasUpdate = (UserDefaults.standard.string(forKey: "latestVersion")).map { versionIsNewer($0, than: currentVersion) } ?? false
+        if hasUpdate {
+            add(islandActionRow("Update available", trailing: "", width: width) { [weak self] in self?.openLatestRelease() }, gap: 11)
+        }
+        add(islandActionRow("Quit Claude Status Bar", trailing: "", width: width) { NSApp.terminate(nil) }, gap: hasUpdate ? 2 : 11)
+
+        let foot = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 16))
+        let fl = islandLabel("Claude Status Bar · v\(currentVersion)", size: 10.5, weight: .regular,
+                             color: NSColor(srgbRed: 0.373, green: 0.353, blue: 0.322, alpha: 1))
+        fl.alignment = .center
+        fl.frame = NSRect(x: 0, y: 2, width: width, height: 13); fl.autoresizingMask = [.width]; foot.addSubview(fl)
+        add(foot, gap: 12)
+
+        let total = blocks.reduce(0) { $0 + $1.gapBefore + $1.view.frame.height }
+        let c = NSView(frame: NSRect(x: 0, y: 0, width: width, height: total))
+        var y = total
+        for b in blocks {
+            y -= b.gapBefore + b.view.frame.height
+            b.view.frame = NSRect(x: 0, y: y, width: width, height: b.view.frame.height)
+            b.view.autoresizingMask = [.width]
+            c.addSubview(b.view)
+        }
+        return c
+    }
+
+    // A grouped rounded card that stacks rows top→down with hairline dividers between them (design).
+    func settingsCard(_ rows: [NSView], width: CGFloat) -> NSView {
+        let totalH = rows.reduce(0) { $0 + $1.frame.height } + CGFloat(max(0, rows.count - 1))
+        let card = NSView(frame: NSRect(x: 0, y: 0, width: width, height: totalH))
+        card.wantsLayer = true
+        card.layer?.backgroundColor = NSColor(white: 1, alpha: 0.035).cgColor
+        card.layer?.cornerRadius = 13
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor(white: 1, alpha: 0.07).cgColor
+        var y = totalH
+        for (i, r) in rows.enumerated() {
+            y -= r.frame.height
+            r.frame = NSRect(x: 0, y: y, width: width, height: r.frame.height)
+            r.autoresizingMask = [.width]
+            card.addSubview(r)
+            if i < rows.count - 1 {
+                y -= 1
+                let sep = NSView(frame: NSRect(x: 12, y: y, width: width - 24, height: 1))
+                sep.wantsLayer = true
+                sep.layer?.backgroundColor = NSColor(white: 1, alpha: 0.05).cgColor
+                sep.autoresizingMask = [.width]
+                card.addSubview(sep)
+            }
+        }
+        return card
+    }
+
+    // "Icon style" row: label left, a dark segmented pill of 3 icon-only buttons right.
+    func iconStyleRow(width: CGFloat) -> NSView {
+        let h: CGFloat = 47
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: h))
+        let l = islandLabel("Icon style", size: 13, weight: .medium, color: NSColor(srgbRed: 0.949, green: 0.929, blue: 0.894, alpha: 1))
+        l.frame = NSRect(x: 12, y: (h - 16) / 2, width: 120, height: 16); row.addSubview(l)
+
+        let styles: [AnimStyle] = [.web, .code, .crab]
+        let btnW: CGFloat = 36, btnH: CGFloat = 27, gap: CGFloat = 3, pad: CGFloat = 3
+        let pillW = pad * 2 + btnW * 3 + gap * 2, pillH = pad * 2 + btnH
+        let pill = NSView(frame: NSRect(x: width - 12 - pillW, y: (h - pillH) / 2, width: pillW, height: pillH))
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = NSColor(white: 0, alpha: 0.3).cgColor
+        pill.layer?.cornerRadius = 9
+        pill.autoresizingMask = [.minXMargin]
+        for (i, st) in styles.enumerated() {
+            let on = animStyle == st
+            let b = IslandRow(height: btnH)
+            b.frame = NSRect(x: pad + CGFloat(i) * (btnW + gap), y: pad, width: btnW, height: btnH)
+            b.layer?.cornerRadius = 6
+            if on { b.layer?.backgroundColor = brand.withAlphaComponent(0.9).cgColor }
+            let iv = NSImageView(frame: NSRect(x: (btnW - 16) / 2, y: (btnH - 16) / 2, width: 16, height: 16))
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            switch st {
+            case .web:  iv.image = sparkleIcon(color: on ? .white : islandGray, frame: 0)
+            case .code: iv.image = codeIcon(color: on ? .white : islandGray, glyph: 3, scale: 1)
+            case .crab: iv.image = crabIcon(color: nil, frame: 0); iv.contentTintColor = on ? .white : islandGray
+            }
+            b.addSubview(iv)
+            b.onClick = { [weak self] in
+                self?.animStyle = st; UserDefaults.standard.set(st.rawValue, forKey: "animStyle")
+                self?.evaluate(); self?.refreshNotchExpanded()
+            }
+            pill.addSubview(b)
+        }
+        row.addSubview(pill)
+        return row
+    }
+
+    // "Accent" row: label left, two circular color swatches (Brand / Adaptive) right.
+    func accentRow(width: CGFloat) -> NSView {
+        let h: CGFloat = 44
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: width, height: h))
+        let l = islandLabel("Accent", size: 13, weight: .medium, color: NSColor(srgbRed: 0.949, green: 0.929, blue: 0.894, alpha: 1))
+        l.frame = NSRect(x: 12, y: (h - 16) / 2, width: 120, height: 16); row.addSubview(l)
+
+        let opts: [(Bool, NSColor)] = [(false, brand), (true, NSColor(srgbRed: 0.906, green: 0.886, blue: 0.847, alpha: 1))]
+        let swD: CGFloat = 24, gap: CGFloat = 10
+        let totalW = swD * 2 + gap
+        let startX = width - 12 - totalW
+        for (i, o) in opts.enumerated() {
+            let on = iconSystem == o.0
+            let b = IslandRow(height: swD)
+            b.frame = NSRect(x: startX + CGFloat(i) * (swD + gap), y: (h - swD) / 2, width: swD, height: swD)
+            b.layer?.cornerRadius = swD / 2
+            b.layer?.masksToBounds = true
+            b.layer?.backgroundColor = o.1.cgColor
+            b.layer?.borderWidth = 2
+            b.layer?.borderColor = (on ? NSColor(srgbRed: 0.98, green: 0.97, blue: 0.95, alpha: 1) : NSColor(white: 1, alpha: 0.2)).cgColor
+            b.autoresizingMask = [.minXMargin]
+            let sys = o.0
+            b.onClick = { [weak self] in
+                self?.iconSystem = sys; UserDefaults.standard.set(sys, forKey: "iconSystem")
+                self?.evaluate(); self?.refreshNotchExpanded()
+            }
+            row.addSubview(b)
+        }
+        return row
+    }
+
+    // One compact toggle row: label left, switch right (no description).
+    func toggleRowCompact(_ title: String, isOn: Bool, width: CGFloat, onToggle: @escaping (Bool) -> Void) -> NSView {
+        let h: CGFloat = 40
+        let row = IslandRow(height: h)
+        row.frame = NSRect(x: 0, y: 0, width: width, height: h)
+        let sw = IslandSwitch(isOn: isOn, brand: brand)
+        sw.frame = NSRect(x: width - 12 - IslandSwitch.w, y: (h - IslandSwitch.h) / 2, width: IslandSwitch.w, height: IslandSwitch.h)
+        sw.autoresizingMask = [.minXMargin]
+        sw.onToggle = onToggle
+        row.addSubview(sw)
+        let l = islandLabel(title, size: 13, weight: .medium, color: NSColor(srgbRed: 0.949, green: 0.929, blue: 0.894, alpha: 1))
+        l.frame = NSRect(x: 12, y: (h - 16) / 2, width: width - 24 - IslandSwitch.w - 8, height: 16)
+        row.addSubview(l)
+        row.onClick = { [weak sw] in guard let s = sw else { return }; s.isOn.toggle(); onToggle(s.isOn) }
+        return row
+    }
+
+    // The same visible-session set the dropdown computes (gated desktop sessions + hide-idle), floored
+    // at one so the list is never empty while a session is alive.
+    func notchVisibleSessions(now: Double) -> [Session] {
+        let ordered = sessions.values.sorted { $0.ts > $1.ts }.filter { s in
+            let eff = s.eff.isEmpty ? effectiveState(s, now: now) : s.eff
+            let resting = !(eff == "permission" || eff == "thinking" || eff == "tool")
+            return s.entrypoint != "claude-desktop" || s.started || !resting
+        }
+        var visible = ordered.filter { s in
+            let eff = s.eff.isEmpty ? effectiveState(s, now: now) : s.eff
+            let resting = !(eff == "permission" || eff == "thinking" || eff == "tool")
+            return !(stalePruneAge > 0 && resting && now - s.ts > stalePruneAge)
+        }
+        if visible.isEmpty, let lead = ordered.first { visible = [lead] }
+        return visible
+    }
+
+    private func islandLabel(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor, mono: Bool = false) -> NSTextField {
+        let f = NSTextField(labelWithString: text)
+        f.font = mono ? .monospacedDigitSystemFont(ofSize: size, weight: weight) : .systemFont(ofSize: size, weight: weight)
+        f.textColor = color
+        f.lineBreakMode = .byTruncatingTail
+        return f
+    }
+
+    func islandSectionHeader(_ title: String, width: CGFloat) -> NSView {
+        let v = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 15))
+        let l = NSTextField(labelWithString: "")
+        // Design: 10px bold, 1.5px letterspacing, muted warm gray.
+        l.attributedStringValue = NSAttributedString(string: title.uppercased(), attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+            .kern: 1.5,
+            .foregroundColor: NSColor(srgbRed: 0.486, green: 0.463, blue: 0.427, alpha: 1), // #7c766d
+        ])
+        l.lineBreakMode = .byTruncatingTail
+        l.frame = NSRect(x: 6, y: 0, width: width - 12, height: 14)
+        l.autoresizingMask = [.width]
+        v.addSubview(l)
+        return v
+    }
+
+
+    // A design-style session row: state dot (soft ring, blinking while active) + name over a state
+    // line, with a live timer and a colored state badge (RUN/THINK/WAIT/DONE/IDLE) on the right.
+    func islandSessionRow(_ s: Session, eff: String, width: CGFloat) -> NSView {
+        // Compact single line (design): dot · name · status (fills, truncates) · timer.
+        let h: CGFloat = 32
+        let row = IslandRow(height: h)
+        row.frame = NSRect(x: 0, y: 0, width: width, height: h)
+        row.layer?.cornerRadius = 9
+        let active = (eff == "thinking" || eff == "tool" || eff == "permission")
+        let color = islandStateColor(eff, state: s.state)
+        if s.id == leadSession?.id { row.layer?.backgroundColor = color.withAlphaComponent(0.1).cgColor }
+
+        // 7px status dot with a soft pulsing glow while active (design: dotGlow).
+        let dotD: CGFloat = 7
+        let dot = NSView(frame: NSRect(x: 10, y: (h - dotD) / 2, width: dotD, height: dotD))
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = color.cgColor
+        dot.layer?.cornerRadius = dotD / 2
+        if active {
+            dot.layer?.shadowColor = color.cgColor
+            dot.layer?.shadowRadius = 4
+            dot.layer?.shadowOffset = .zero
+            let glow = CABasicAnimation(keyPath: "shadowOpacity")
+            glow.fromValue = 0.1; glow.toValue = 0.95
+            glow.duration = 0.9; glow.autoreverses = true; glow.repeatCount = .infinity
+            dot.layer?.add(glow, forKey: "glow")
+        }
+        row.addSubview(dot)
+
+        // Timer pinned right: turn clock while working, wait clock while a permission sits.
+        let now = Date().timeIntervalSince1970
+        var timerStr = ""
+        if (eff == "thinking" || eff == "tool"), s.startedAt > 0 { timerStr = elapsed(max(0, Int(now - s.startedAt))) }
+        else if eff == "permission" { timerStr = elapsed(max(0, Int(now - s.ts))) }
+        var rightX = width - 10
+        if !timerStr.isEmpty {
+            let e = islandLabel(timerStr, size: 11, weight: .medium, color: NSColor(white: 1, alpha: 0.5), mono: true)
+            let ew = ceil((timerStr as NSString).size(withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)]).width) + 4
+            e.frame = NSRect(x: rightX - ew, y: (h - 14) / 2, width: ew, height: 14)
+            e.autoresizingMask = [.minXMargin]
+            row.addSubview(e)
+            rightX -= ew + 8
+        }
+
+        // Name (fixed width to its content), then the status line filling the middle, truncating.
+        let nameX: CGFloat = 27
+        let nameFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let nameW = min(width * 0.5, ceil((sessionName(s) as NSString).size(withAttributes: [.font: nameFont]).width) + 8)
+        let name = islandLabel(sessionName(s), size: 12.5, weight: .medium, color: NSColor(srgbRed: 0.949, green: 0.929, blue: 0.894, alpha: 1))
+        name.frame = NSRect(x: nameX, y: (h - 15) / 2, width: nameW, height: 15)
+        row.addSubview(name)
+        let lineX = nameX + nameW + 9
+        let line = islandLabel(statusText(s, eff: eff), size: 11, weight: .regular, color: NSColor(srgbRed: 0.486, green: 0.463, blue: 0.427, alpha: 1))
+        line.frame = NSRect(x: lineX, y: (h - 14) / 2, width: max(10, rightX - 8 - lineX), height: 14)
+        line.autoresizingMask = [.width]
+        row.addSubview(line)
+
+        let sid = s.id, ep = s.entrypoint, tp = s.termProgram, tt = s.tty, tx = s.tmux
+        row.onClick = { [weak self] in self?.collapseNotch(); self?.openSession(sid, entrypoint: ep, termProgram: tp, tty: tt, tmux: tx) }
+        return row
+    }
+
+    func islandActionRow(_ title: String, trailing: String, width: CGFloat, action: @escaping () -> Void) -> NSView {
+        let h: CGFloat = 28
+        let row = IslandRow(height: h)
+        row.frame = NSRect(x: 0, y: 0, width: width, height: h)
+        let l = islandLabel(title, size: 13, weight: .regular, color: .white)
+        l.frame = NSRect(x: 10, y: (h - 16) / 2, width: width - 60, height: 16)
+        l.autoresizingMask = [.width]
+        row.addSubview(l)
+        if !trailing.isEmpty {
+            let t = islandLabel(trailing, size: 12, weight: .regular, color: NSColor(white: 1, alpha: 0.4))
+            let tw = ceil(t.attributedStringValue.size().width)
+            t.frame = NSRect(x: width - 10 - tw, y: (h - 14) / 2, width: tw, height: 14)
+            t.autoresizingMask = [.minXMargin]
+            row.addSubview(t)
+        }
+        row.onClick = action
+        return row
+    }
+
+
+    @objc func screensChanged() { setupNotch() }
+
+    // The single choke point for the icon image: routes to the notch view or the menu bar button.
+    func setSinkImage(_ img: NSImage) {
+        if let v = notchView {
+            v.iconView.image = img
+            v.iconView.contentTintColor = .white   // template frame → white on the black panel
+        } else {
+            statusItem.button?.contentTintColor = nil
+            statusItem.button?.image = img
+        }
     }
 
     // Re-runs on first install AND on every version change, so upgrades pick up hook
@@ -676,8 +1641,8 @@ final class StatusController: NSObject, NSMenuDelegate {
             for s in visible {
                 let eff = s.eff.isEmpty ? effectiveState(s, now: now) : s.eff
                 let view = SessionRowView(id: s.id, width: CGFloat(uiConfig()["boxWidth"] ?? 300))
-                let sid = s.id, ep = s.entrypoint, tp = s.termProgram
-                view.onClick = { [weak self] in menu.cancelTracking(); self?.openSession(sid, entrypoint: ep, termProgram: tp) }
+                let sid = s.id, ep = s.entrypoint, tp = s.termProgram, tt = s.tty, tx = s.tmux
+                view.onClick = { [weak self] in menu.cancelTracking(); self?.openSession(sid, entrypoint: ep, termProgram: tp, tty: tt, tmux: tx) }
                 configureSessionRow(view, s, eff: eff)
                 let it = NSMenuItem()
                 it.view = view
@@ -728,6 +1693,19 @@ final class StatusController: NSObject, NSMenuDelegate {
             self?.useThinkingWords = on
             UserDefaults.standard.set(on, forKey: "thinkingWords")
             self?.evaluate()   // re-render the bar label immediately with/without the rotating word
+        })
+        // Only meaningful on a Mac that has a notch (persisted, so it still shows when docked clamshell).
+        if UserDefaults.standard.bool(forKey: "machineHasNotch") || NotchGeometry.machineHasNotch() {
+            menu.addItem(toggleRow(title: "Show at notch", isOn: showAtNotch) { [weak self] on in
+                self?.showAtNotch = on
+                UserDefaults.standard.set(on, forKey: "showAtNotch")
+                self?.setupNotch()   // build or tear down the notch window; flips the status item
+            })
+        }
+        // Experimental: iTerm exact-tab focus + Allow/Deny keystroke on permission prompts (one-time
+        // Automation grant). tmux Allow/Deny works without this toggle (no grant needed).
+        menu.addItem(toggleRow(title: "Exact terminal focus", qualifier: "experimental", isOn: exactTerminalFocus) { [weak self] on in
+            self?.setExactTerminalFocus(on)
         })
 
         let animParent = NSMenuItem(title: "Animation", action: nil, keyEquivalent: "")
@@ -1043,24 +2021,265 @@ final class StatusController: NSObject, NSMenuDelegate {
     // (local_<random>.json with cliSessionId=<id>) every click, it's an import verb, not focus.
     // The clean focus path (claude://code/<bridgeSessionId>) needs an opaque session_/cse_ bridge
     // id the app never exposes to us (not in env, not derivable from the UUID, undefined on disk).
-    // CLI session: bring its terminal APP to the front (zero permission). Targeting the exact
-    // window/tab needs a one-time Automation grant, deferred to the opt-in build (issue #19).
-    func openSession(_ id: String, entrypoint: String, termProgram: String) {
+    // CLI session: bring its terminal APP to the front (zero permission). Exact window/tab focus
+    // (tmux pane or iTerm tab by tty) is layered on for the permission Allow/Deny buttons below.
+    func openSession(_ id: String, entrypoint: String, termProgram: String, tty: String, tmux: Bool) {
         if entrypoint == "claude-desktop" { openClaude(); return }
-        // Map TERM_PROGRAM to a name `open -a` understands; most terminals match verbatim.
-        let app: String
+        // tmux session: select the pane so the click lands you on the exact prompt. iTerm tab focus
+        // (the pane's host window) is best-effort on top.
+        if tmux, !tty.isEmpty { _ = focusTmuxPane(tty: tty) }
+        bringTerminalAppToFront(termProgram)
+    }
+
+    // Map TERM_PROGRAM to a name `open -a` understands; most terminals match verbatim.
+    func terminalAppName(_ termProgram: String) -> String? {
         switch termProgram {
-        case "Apple_Terminal": app = "Terminal"
-        case "iTerm.app":      app = "iTerm"
-        case "vscode":         app = "Visual Studio Code"
-        case "WarpTerminal":   app = "Warp"
-        case "":               return  // unknown surface, nothing to focus
-        default:               app = termProgram  // Ghostty, WezTerm, Tabby, Hyper, kitty, …
+        case "Apple_Terminal": return "Terminal"
+        case "iTerm.app":      return "iTerm"
+        case "vscode":         return "Visual Studio Code"
+        case "WarpTerminal":   return "Warp"
+        case "":               return nil  // unknown surface
+        default:               return termProgram  // Ghostty, WezTerm, Tabby, Hyper, kitty, …
         }
+    }
+
+    // Bring the terminal app to the front (no permission).
+    func bringTerminalAppToFront(_ termProgram: String) {
+        guard let app = terminalAppName(termProgram) else { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         p.arguments = ["-a", app]
         try? p.run()
+    }
+
+    // MARK: permission Allow/Deny keystroke
+    //
+    // A permission prompt sits in the session's own terminal. We answer it by delivering a keystroke
+    // to the exact pane/tab that owns the session's tty — never a blind send. Two backends:
+    //   • tmux   → `tmux send-keys -t <pane>` to the pane whose #{pane_tty} matches (no macOS grant).
+    //   • iTerm  → AppleScript: focus the tab whose tty matches, then System Events keystroke
+    //              (needs the one-time Automation grant, gated behind the experimental toggle).
+    // The dispatcher only fires when a supported backend can target the exact session; anything else
+    // returns .unsupported and the UI hides the buttons, so we never type into the wrong place.
+
+    enum PermAnswer { case allow, deny }
+    enum KeyOutcome { case sent, denied, unsupported }
+
+    // True when we can deliver a keystroke to this session's prompt (drives button visibility).
+    //   • tmux       → exact pane by tty. Always safe, no grant.               (needs tty)
+    //   • iTerm.app  → exact tab by tty via AppleScript.                        (needs tty + grant)
+    //   • vscode     → focus VS Code + BLIND keystroke to the focused terminal. (grant, NO exact
+    //                  targeting — VS Code can't be addressed by tty, so this types into whatever
+    //                  terminal tab is frontmost. Gated behind the toggle so it's opt-in.)
+    func canSendPermissionKey(_ s: Session) -> Bool {
+        guard s.entrypoint != "claude-desktop" else { return false }
+        if s.tmux, !s.tty.isEmpty { return true }                        // tmux: exact, no grant
+        if s.termProgram == "iTerm.app", !s.tty.isEmpty { return exactTerminalFocus }  // iTerm: exact + grant
+        if s.termProgram == "vscode" || s.entrypoint == "claude-vscode" { return exactTerminalFocus } // vscode: blind + grant
+        return false
+    }
+
+    // Debug log for the permission keystroke flow (per the "log the flow" workflow). Always on for
+    // now while we validate; writes to ~/.claude/statusbar/perm.log.
+    func permDbg(_ msg: String) {
+        let line = "\(Date()) \(msg)\n"
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/statusbar/perm.log")
+        if let data = line.data(using: .utf8) {
+            if let fh = try? FileHandle(forWritingTo: url) {
+                fh.seekToEndOfFile(); fh.write(data); try? fh.close()
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
+    func sendPermissionKey(_ s: Session, _ answer: PermAnswer) -> KeyOutcome {
+        permDbg("sendPermissionKey answer=\(answer) tmux=\(s.tmux) tty=\(s.tty) term=\(s.termProgram) entry=\(s.entrypoint)")
+        guard s.entrypoint != "claude-desktop" else { permDbg("  -> desktop (.unsupported)"); return .unsupported }
+        if s.tmux, !s.tty.isEmpty { return sendTmuxKey(tty: s.tty, answer: answer) }
+        if s.termProgram == "iTerm.app", !s.tty.isEmpty, exactTerminalFocus {
+            return sendITermKey(tty: s.tty, answer: answer)
+        }
+        if s.termProgram == "vscode" || s.entrypoint == "claude-vscode", exactTerminalFocus {
+            return sendVSCodeKey(answer: answer)
+        }
+        return .unsupported
+    }
+
+    // Is this app trusted for Accessibility (required to post System Events keystrokes)? `prompt:true`
+    // shows the system "grant Accessibility" dialog + adds the app to the list once.
+    func hasAccessibility(prompt: Bool) -> Bool {
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        return AXIsProcessTrustedWithOptions([key: prompt] as CFDictionary)
+    }
+
+    // VS Code integrated terminal: no way to address a specific tab by tty (VS Code exposes no such
+    // AppleScript), so we bring VS Code to the front and BLIND-send the key to whatever terminal is
+    // focused. Correct only when the session's terminal is the frontmost one — hence gated behind the
+    // toggle and clearly labeled experimental. System Events keystrokes need the Accessibility grant.
+    // Allow = "y", Deny = Escape.
+    func sendVSCodeKey(answer: PermAnswer) -> KeyOutcome {
+        guard hasAccessibility(prompt: true) else {
+            permDbg("  sendVSCodeKey: no Accessibility grant → prompted, aborting this click")
+            return .denied   // caller flips the toggle off; user grants then re-enables
+        }
+        let keystroke = answer == .allow ? "keystroke \"y\"" : "key code 53"  // 53 = Escape
+        let script = """
+        tell application "Visual Studio Code" to activate
+        delay 0.15
+        tell application "System Events" to \(keystroke)
+        """
+        var err: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&err)
+        if let err = err {
+            let code = (err["NSAppleScriptErrorNumber"] as? Int) ?? 0
+            permDbg("  sendVSCodeKey error \(code): \(err)")
+            return code == -1743 ? .denied : .unsupported
+        }
+        permDbg("  sendVSCodeKey: sent \(answer) (blind, to focused VS Code terminal)")
+        return .sent
+    }
+
+    // Resolve a tty to its tmux pane id (%N) by matching #{pane_tty}. "" if not found / no server.
+    func tmuxPaneID(forTTY tty: String) -> String? {
+        let dev = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+        guard let bin = tmuxBin else { permDbg("  tmuxPaneID: no tmux binary found"); return nil }
+        let out = runCapture(bin, ["list-panes", "-a", "-F", "#{pane_id} #{pane_tty}"])
+        permDbg("  tmuxPaneID: bin=\(bin) dev=\(dev) list-panes out=\(out ?? "<nil>")")
+        guard let out = out else { return nil }
+        for line in out.split(separator: "\n") {
+            let cols = line.split(separator: " ", maxSplits: 1)
+            if cols.count == 2, cols[1] == Substring(dev) { permDbg("  tmuxPaneID: matched \(cols[0])"); return String(cols[0]) }
+        }
+        permDbg("  tmuxPaneID: no pane matched dev=\(dev)")
+        return nil
+    }
+
+    // Path to the tmux binary (Homebrew arm64 / Intel / system), or nil if tmux isn't installed.
+    var tmuxBin: String? {
+        for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    // Select the pane owning this tty (so a click lands on the exact prompt). Returns false if unfound.
+    @discardableResult
+    func focusTmuxPane(tty: String) -> Bool {
+        guard let bin = tmuxBin, let pane = tmuxPaneID(forTTY: tty) else { return false }
+        // select-window then select-pane so the right window is shown AND the right pane is active.
+        _ = runCapture(bin, ["select-window", "-t", pane])
+        _ = runCapture(bin, ["select-pane", "-t", pane])
+        return true
+    }
+
+    // Deliver the answer keystroke into the tmux pane. Allow = Enter (accepts the highlighted
+    // "Yes" default of the permission prompt); Deny = Escape. send-keys addresses the pane by id,
+    // so it lands regardless of which tmux window is currently shown.
+    func sendTmuxKey(tty: String, answer: PermAnswer) -> KeyOutcome {
+        guard let bin = tmuxBin, let pane = tmuxPaneID(forTTY: tty) else { permDbg("  sendTmuxKey: no bin/pane -> .unsupported"); return .unsupported }
+        _ = runCapture(bin, ["select-window", "-t", pane])
+        _ = runCapture(bin, ["select-pane", "-t", pane])
+        let key = answer == .allow ? "Enter" : "Escape"
+        let r = runCapture(bin, ["send-keys", "-t", pane, key])
+        permDbg("  sendTmuxKey: sent \(key) to \(pane), send-keys out=\(r ?? "<nil>")")
+        return .sent
+    }
+
+    // iTerm: address the session by tty and write the answer straight into it with iTerm's native
+    // `write text` — NO System Events, so this needs only the Automation grant (apple-events), not
+    // the heavier Accessibility grant. The prompt's TUI reads the injected bytes as keystrokes.
+    // Allow = "y", Deny = the Escape byte (). `newline no` so we send just the char, no Enter.
+    func sendITermKey(tty: String, answer: PermAnswer) -> KeyOutcome {
+        let dev = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+        // AppleScript string literal for the char: "y", or the ESC control char via `character id 27`.
+        let textExpr = answer == .allow ? "\"y\"" : "(character id 27)"
+        let script = """
+        tell application "iTerm"
+          activate
+          repeat with w in windows
+            repeat with t in tabs of w
+              repeat with s in sessions of t
+                if tty of s is "\(dev)" then
+                  select s
+                  select t
+                  tell w to select
+                  tell s to write text \(textExpr) newline no
+                  return
+                end if
+              end repeat
+            end repeat
+          end repeat
+        end tell
+        """
+        var err: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&err)
+        guard let err = err else { permDbg("  sendITermKey: wrote \(answer) to \(dev)"); return .sent }
+        let code = (err["NSAppleScriptErrorNumber"] as? Int) ?? 0
+        permDbg("  sendITermKey error \(code): \(err)")
+        return code == -1743 ? .denied : .unsupported   // -1743 = errAEEventNotPermitted (grant declined)
+    }
+
+    // Run a command, capture stdout (trimmed). nil on launch failure. Used for tmux queries/sends.
+    @discardableResult
+    func runCapture(_ path: String, _ args: [String]) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: path) else { permDbg("  runCapture: not executable \(path)"); return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe(), errPipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = errPipe
+        do { try p.run() } catch { permDbg("  runCapture: launch failed \(path) \(args): \(error)"); return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        if !errData.isEmpty, let e = String(data: errData, encoding: .utf8) {
+            permDbg("  runCapture stderr[\(args.first ?? "")]: \(e.trimmingCharacters(in: .whitespacesAndNewlines))")
+        }
+        return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Persist the experimental toggle. Explain the macOS Automation grant on the first enable, or again
+    // after a denial (the deny handler clears exactFocusToastShown). Deferred so the menu's toggle
+    // interaction finishes before the modal alert. Only gates the iTerm AppleScript path — tmux
+    // send-keys works without any grant, so tmux Allow/Deny buttons show regardless of this toggle.
+    func setExactTerminalFocus(_ on: Bool) {
+        exactTerminalFocus = on
+        UserDefaults.standard.set(on, forKey: "exactTerminalFocus")
+        guard on, !UserDefaults.standard.bool(forKey: "exactFocusToastShown") else { return }
+        UserDefaults.standard.set(true, forKey: "exactFocusToastShown")
+        DispatchQueue.main.async { [weak self] in self?.showExactFocusToast() }
+    }
+
+    // Clear this app's Apple Events automation decisions so the next AppleScript attempt re-triggers the
+    // macOS prompt (lets a re-enable recover from an earlier denial). tccutil edits the user TCC db, no sudo.
+    func resetAutomationGrant() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        p.arguments = ["reset", "AppleEvents", Bundle.main.bundleIdentifier ?? "com.local.claudestatusbar"]
+        try? p.run()
+    }
+
+    func showExactFocusToast() {
+        let a = NSAlert()
+        a.messageText = "Exact terminal focus (experimental)"
+        a.informativeText = "When enabled, clicking a CLI session focuses its exact terminal tab, and the Allow/Deny buttons on a permission prompt answer it in the session.\n\nHeads up: for iTerm this needs a one-time prompt from Apple to control it. You can revoke it any time under System Settings > Privacy & Security > Automation. (tmux sessions work without any prompt.)"
+        a.addButton(withTitle: "Got it")
+        a.addButton(withTitle: "Learn more")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertSecondButtonReturn,
+           let url = URL(string: "https://github.com/m1ckc3s/claude-status-bar/issues/19") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    // iTerm grant declined → flip the toggle back off and reset the grant so a re-enable re-prompts.
+    func handleGrantDenied() {
+        setExactTerminalFocus(false)
+        UserDefaults.standard.set(false, forKey: "exactFocusToastShown")
+        resetAutomationGrant()
     }
 
 
@@ -1084,6 +2303,7 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     func tick() {
         checkLifecycle()
+        updateActiveNotchScreen()   // follow the cursor across displays
         reloadSessions()
         reloadAgents()
         evaluate()
@@ -1217,6 +2437,7 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     func evaluate() {
         let now = Date().timeIntervalSince1970
+        var chime = false
 
         for id in Array(sessions.keys) {
             guard var s = sessions[id] else { continue }
@@ -1232,11 +2453,13 @@ final class StatusController: NSObject, NSMenuDelegate {
                 try? FileManager.default.removeItem(atPath: agentsDirPath(id))
                 sessions[id] = nil; fileMTimes[id + ".json"] = nil; prevState[id] = nil; sessionWord[id] = nil
                 sessionAgents[id] = nil; agentDirMTimes[id] = nil
+                soundPrev[id] = nil; turnStart[id] = nil; doneInfo[id] = nil
                 continue
             }
             sessions[id] = s
             updateThinkingWord(s)
             prevState[s.id] = s.state
+            if soundEdgeDone(s, now: now) { chime = true }   // also records the island's done flash
         }
         for id in Array(prevState.keys) where sessions[id] == nil { prevState[id] = nil; sessionWord[id] = nil }
 
@@ -1258,6 +2481,8 @@ final class StatusController: NSObject, NSMenuDelegate {
             }
             sessions[id] = s
         }
+        for id in Array(soundPrev.keys) where sessions[id] == nil { soundPrev[id] = nil; turnStart[id] = nil; doneInfo[id] = nil }
+        if chime, playCompletionSound { completionSound?.play() }
 
         // Surface the single highest-priority session (permission > working > …); ties broken by
         // recency, so within a tier the most recently active session wins.
@@ -1265,20 +2490,44 @@ final class StatusController: NSObject, NSMenuDelegate {
             let pa = priority(of: a.eff), pb = priority(of: b.eff)
             return pa == pb ? a.ts < b.ts : pa < pb
         }
+        leadSession = lead   // the dashboard hero card reflects this session
         statusItem.button?.toolTip = lead.map(sessionMenuLine)  // names repo + surface + state on hover
 
         guard let lead = lead else { renderResting(); return }
         switch lead.eff {
         case "permission":
-            render(label: statusText(lead, eff: lead.eff), color: amber, animate: false, startedAt: 0, dot: true)
+            // startedAt = when the permission started waiting (hooks zero the turn clock here),
+            // so the pill counts how long the request has sat unanswered — like the design.
+            render(label: statusText(lead, eff: lead.eff), color: amber, animate: false,
+                   startedAt: lead.ts, dot: true, accent: amber)
         case "thinking", "tool":
-            render(label: statusText(lead, eff: lead.eff), color: iconColor, animate: true, startedAt: lead.startedAt)
+            render(label: statusText(lead, eff: lead.eff), color: iconColor, animate: true,
+                   startedAt: lead.startedAt, accent: brand)
         default:
-            renderResting()
+            // Done flash: hold a green check + the turn's duration for a few seconds, then rest.
+            if lead.state == "done", let info = doneInfo[lead.id], now - info.at < doneFlashSecs {
+                render(label: "Done", color: islandGreen, animate: false, startedAt: 0,
+                       accent: islandGreen, done: true, doneDur: info.dur)
+            } else {
+                renderResting()
+            }
         }
     }
 
     func renderResting() { render(label: "", color: iconColor, animate: false, startedAt: 0) }
+
+    // Order the notch window in/out. Real notch: always shown (fuses with the physical cutout, even
+    // idle). Synthetic pill (external monitor, no notch): shown only when there's something to surface
+    // or while the panel is expanded — so an idle pill doesn't float over an external screen.
+    func applyNotchVisibility() {
+        guard let win = notchWindow, let geo = notchGeo, let view = notchView else { return }
+        let show = !geo.synthetic || !notchResting || view.expanded
+        if show {
+            if !win.isVisible { win.orderFrontRegardless(); notchDbg("pill shown (synthetic=\(geo.synthetic) resting=\(notchResting))") }
+        } else if win.isVisible {
+            win.orderOut(nil); notchDbg("pill hidden (idle on synthetic external)")
+        }
+    }
 
     // Per-session effective state with two recovery nets: an absolute age cap, plus the transcript
     // "interrupted by user" marker (Esc / denied permission fire no hook, freezing the file). "done"
@@ -1294,6 +2543,22 @@ final class StatusController: NSObject, NSMenuDelegate {
         return s.state == "done" ? "idle" : s.state
     }
 
+    // Detect a session's working->done edge for the chime (turns >= 5 min only). Updates the
+    // per-session bookkeeping every call and returns true exactly once per qualifying edge.
+    func soundEdgeDone(_ s: Session, now: Double) -> Bool {
+        let prev = soundPrev[s.id] ?? ""
+        if s.state == "thinking" || s.state == "tool", s.startedAt > 0 { turnStart[s.id] = s.startedAt }
+        var edge = false
+        if s.state == "done", prev != "done" {
+            // Record the edge for the island's done flash (duration 0 when the turn start is unknown).
+            let st = turnStart[s.id] ?? 0
+            doneInfo[s.id] = (at: now, dur: st > 0 ? Int(now - st) : 0)
+            if st > 0, now - st >= 300 { edge = true }
+        }
+        if s.state == "done" { turnStart[s.id] = 0 }
+        soundPrev[s.id] = s.state
+        return edge
+    }
 
     // MARK: self-quit lifecycle
 
@@ -1354,13 +2619,34 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     // MARK: render
 
-    func render(label: String, color: NSColor?, animate: Bool, startedAt: Double, dot: Bool = false) {
-        guard let button = statusItem.button else { return }
-        button.contentTintColor = nil // we paint the icon color ourselves; template-tint is unreliable
+    func render(label: String, color: NSColor?, animate: Bool, startedAt: Double, dot: Bool = false,
+                accent: NSColor? = nil, done: Bool = false, doneDur: Int = 0) {
+        // The menu bar button may be hidden (notch mode); the notch view is the sink then. Bail only
+        // when NEITHER surface exists.
+        guard statusItem.button != nil || notchView != nil else { return }
+        statusItem.button?.contentTintColor = nil // we paint the icon color ourselves; template-tint is unreliable
         activeBase = label
         activeColor = color
+        activeDot = dot
+        stateAccent = accent
+        flashDone = done
+        flashDoneDur = doneDur
         self.startedAt = startedAt
+        // Resting = nothing to show (no active turn, no waiting permission, no done flash). A synthetic
+        // pill on an external monitor hides while resting; the real notch always stays (it fuses).
+        notchResting = !animate && !dot && !done && label.isEmpty
+        applyNotchVisibility()
 
+        // Static icon per state (also the seed frame below). On the notch: permission shows the logo
+        // glyph tinted amber (design), done shows the green check circle, rest is a dim gray glyph.
+        func staticIcon() -> NSImage {
+            if done { return doneIcon() }
+            if dot { return notchView != nil ? restingIcon(color: accent ?? color) : dotIcon(color: color) }
+            return restingIcon(color: notchView != nil ? islandGray : color)
+        }
+
+        // On the notch, idle = a bare cutout: clear the glyph so nothing flanks the camera.
+        let idleOnNotch = notchView != nil && notchResting
         if animate {
             if animTimer == nil {
                 let t = Timer(timeInterval: 1.0 / fps, repeats: true) { [weak self] _ in self?.animStep() }
@@ -1370,24 +2656,67 @@ final class StatusController: NSObject, NSMenuDelegate {
         } else {
             animTimer?.invalidate(); animTimer = nil
             frameIdx = 0
-            button.image = dot ? dotIcon(color: color) : restingIcon(color: color)
+            if idleOnNotch { notchView?.iconView.image = nil } else { setSinkImage(staticIcon()) }
         }
         applyTitle()
-        if button.image == nil { button.image = dot ? dotIcon(color: color) : restingIcon(color: color) }
+        // Seed a frame immediately so entering an animated state never flashes empty before the
+        // first animStep tick (the notch view and the menu bar button both start out imageless).
+        let hasImage = notchView != nil ? (notchView?.iconView.image != nil) : (statusItem.button?.image != nil)
+        if !hasImage && !idleOnNotch {
+            setSinkImage(animate ? iconImage(color: notchView != nil ? nil : color, frame: frameIdx) : staticIcon())
+        }
     }
 
     func animStep() {
         frameIdx = (frameIdx + 1) % frameCount
-        statusItem.button?.image = iconImage(color: activeColor, frame: frameIdx)
-        applyTitle() // refresh the elapsed clock
+        // On the notch, pass color:nil so the frame is a template and paints white on black.
+        setSinkImage(iconImage(color: notchView != nil ? nil : activeColor, frame: frameIdx))
+        if let hero = notchHeroIcon {   // the expanded dashboard's big icon animates in lockstep
+            hero.image = iconImage(color: nil, frame: frameIdx)
+            hero.contentTintColor = .white
+        }
+        applyTitle() // refresh the elapsed clock (also drives the hero clock)
+    }
+
+    // Keep the expanded hero card's big clock live for every state: turn clock while working, wait
+    // clock while a permission sits, static duration on the done flash. Runs from applyTitle so the
+    // permission clock ticks even though no animation timer is active.
+    func updateNotchHeroClock() {
+        guard let t = notchHeroTimer, let lead = leadSession else { return }
+        let now = Date().timeIntervalSince1970
+        let eff = lead.eff.isEmpty ? effectiveState(lead, now: now) : lead.eff
+        if eff == "thinking" || eff == "tool", lead.startedAt > 0 {
+            t.stringValue = elapsed(max(0, Int(now - lead.startedAt)))
+        } else if eff == "permission" {
+            t.stringValue = elapsed(max(0, Int(now - lead.ts)))
+        } else if flashDone, flashDoneDur > 0 {
+            t.stringValue = elapsed(flashDoneDur)
+        }
     }
 
     func applyTitle() {
+        let elapsedText: String
+        if flashDone {
+            elapsedText = (showTimer && flashDoneDur > 0) ? elapsed(flashDoneDur) : ""
+        } else {
+            elapsedText = (showTimer && startedAt > 0)
+                ? elapsed(max(0, Int(Date().timeIntervalSince1970 - startedAt))) : ""
+        }
+        // Notch sink: label + timer live in their own fields, flanking the camera. At rest they go
+        // empty so the collapsed island shrinks to the bare notch (design).
+        if let v = notchView {
+            let resting = activeBase.isEmpty
+            v.labelField.stringValue = resting ? "" : activeBase
+            v.labelField.textColor = .white
+            v.timerField.stringValue = elapsedText
+            v.timerField.textColor = stateAccent ?? brand   // amber waiting / green done / brand working
+            updateNotchHeroClock()
+            resizeNotchToFit()
+            return
+        }
         guard let button = statusItem.button else { return }
         var text = activeBase
-        if showTimer, startedAt > 0 {
-            text += "  " + elapsed(max(0, Int(Date().timeIntervalSince1970 - startedAt)))
-        }
+        if !elapsedText.isEmpty { text += "  " + elapsedText }
         if text.isEmpty {
             button.imagePosition = .imageOnly
             button.attributedTitle = NSAttributedString(string: "")
@@ -1411,7 +2740,7 @@ final class StatusController: NSObject, NSMenuDelegate {
     }
 
     func iconImage(color: NSColor?, frame: Int) -> NSImage {
-        if animStyle == .web { return tint(frames, color: color, frame: frame) }
+        if animStyle == .web { return sparkleIcon(color: color, frame: frame) }
         if animStyle == .crab { return crabIcon(color: color, frame: frame) }
         let i = (frame / codeSub) % codeGlyphs.count
         let local = (CGFloat(frame % codeSub) + 0.5) / CGFloat(codeSub) // 0…1 within this glyph
@@ -1477,7 +2806,46 @@ final class StatusController: NSObject, NSMenuDelegate {
     let logoSet: [NSImage] = Data(base64Encoded: claudeLogoPNG).flatMap(NSImage.init(data:)).map { [$0] } ?? []
     func restingIcon(color: NSColor?) -> NSImage {
         if animStyle == .crab { return crabIcon(color: color, frame: 0) }
+        if animStyle == .web { return sparkleIcon(color: color, frame: 0) }   // static, un-rotated sparkle
         return tint(logoSet.isEmpty ? frames : logoSet, color: color, frame: 0)
+    }
+
+    // A crisp SF Symbol "sparkle" pre-rendered into a padded square so rotation pivots on its center.
+    lazy var sparkleBase: NSImage? = {
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        guard let sym = NSImage(systemSymbolName: "sparkle", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) else { return nil }
+        let side = ceil(max(sym.size.width, sym.size.height)) + 3
+        let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { _ in
+            sym.draw(in: NSRect(x: (side - sym.size.width) / 2, y: (side - sym.size.height) / 2,
+                                width: sym.size.width, height: sym.size.height))
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }()
+
+    // The "Spark" style: a clean SF Symbol sparkle that slowly spins and gently breathes while a turn
+    // runs. Template when color==nil (the notch paints it white / the menu bar adapts it black/white);
+    // tinted to `color` in brand-Orange mode. Replaces the old pixel sprite for a crisp vector look.
+    func sparkleIcon(color: NSColor?, frame: Int) -> NSImage {
+        guard let base = sparkleBase else { return NSImage(size: NSSize(width: 16, height: 16)) }
+        let size = base.size
+        let t = CGFloat(frame) / CGFloat(max(1, sparkleFrameCount))     // 0…1 around the loop
+        let angle = t * 360
+        let pulse = 0.9 + 0.1 * (0.5 - 0.5 * cos(t * 2 * .pi))          // subtle breathe
+        let img = NSImage(size: size, flipped: false) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            let c = CGPoint(x: size.width / 2, y: size.height / 2)
+            ctx.translateBy(x: c.x, y: c.y)
+            ctx.rotate(by: -angle * .pi / 180)
+            ctx.scaleBy(x: pulse, y: pulse)
+            ctx.translateBy(x: -c.x, y: -c.y)
+            base.draw(in: rect)
+            if let col = color { col.set(); rect.fill(using: .sourceAtop) }   // tint the glyph in brand mode
+            return true
+        }
+        img.isTemplate = (color == nil)
+        return img
     }
 
     // nil color (System) => adaptive shaded template (see adaptiveCrabFrame in CrabRender.swift);
@@ -1495,6 +2863,29 @@ final class StatusController: NSObject, NSMenuDelegate {
             return true
         }
         img.isTemplate = (color == nil)
+        return img
+    }
+
+    // The design's "done" badge: a solid green circle with a white checkmark, drawn by hand so it
+    // renders full-color on both sinks (SF Symbol tinting is unreliable in the borderless panel).
+    func doneIcon() -> NSImage {
+        let s: CGFloat = 18
+        let green = islandGreen
+        let img = NSImage(size: NSSize(width: s, height: s), flipped: false) { _ in
+            green.setFill()
+            NSBezierPath(ovalIn: NSRect(x: 0.5, y: 0.5, width: s - 1, height: s - 1)).fill()
+            NSColor.white.setStroke()
+            let p = NSBezierPath()
+            p.lineWidth = 2
+            p.lineCapStyle = .round
+            p.lineJoinStyle = .round
+            p.move(to: NSPoint(x: 5.0, y: 9.2))
+            p.line(to: NSPoint(x: 7.8, y: 6.4))
+            p.line(to: NSPoint(x: 13.0, y: 11.6))
+            p.stroke()
+            return true
+        }
+        img.isTemplate = false
         return img
     }
 

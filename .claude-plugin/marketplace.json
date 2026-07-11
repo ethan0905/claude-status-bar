@@ -1,6 +1,6 @@
 {
   "name": "claude-status-bar",
-  "owner": { "name": "Mick Cesanek" },
+  "owner": { "name": "Edward Ha" },
   "description": "Menu bar status indicator for Claude Code.",
   "plugins": [
     {
@@ -8,8 +8,13 @@
       "displayName": "Claude Status Bar",
       "source": "./",
       "description": "Menu bar indicator for Claude Code: animated spark, elapsed timer, and open/close lifecycle.",
+<<<<<<< HEAD
       "version": "0.3.4",
       "homepage": "https://github.com/m1ckc3s/claude-status-bar",
+=======
+      "version": "0.4.0",
+      "homepage": "https://github.com/QuocVietHa08/agent-status-bar",
+>>>>>>> island/main
       "license": "MIT"
     }
   ]
