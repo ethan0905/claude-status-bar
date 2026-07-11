@@ -401,15 +401,21 @@ final class NotchContentView: NSView {
         // lip-capped 6pt that read as a sharp box next to the real notch. Bare-notch idle sits
         // entirely over the cutout, so its (smaller) rounding is invisible either way.
         let r: CGFloat = expanded ? 18 : min(12, h / 2)
-        // Square top corners (fuse with the notch / top edge); rounded bottom only.
         let path = CGMutablePath()
-        path.move(to: CGPoint(x: 0, y: h))
-        path.addLine(to: CGPoint(x: w, y: h))
-        path.addLine(to: CGPoint(x: w, y: r))
-        path.addArc(center: CGPoint(x: w - r, y: r), radius: r, startAngle: 0, endAngle: -.pi / 2, clockwise: true)
-        path.addLine(to: CGPoint(x: r, y: 0))
-        path.addArc(center: CGPoint(x: r, y: r), radius: r, startAngle: -.pi / 2, endAngle: .pi, clockwise: true)
-        path.closeSubpath()
+        if synthetic {
+            // No physical notch to fuse with (external monitor pill): round all four corners.
+            path.addRoundedRect(in: CGRect(x: 0, y: 0, width: w, height: h),
+                                cornerWidth: min(r, w / 2), cornerHeight: min(r, h / 2))
+        } else {
+            // Square top corners (fuse with the notch / top edge); rounded bottom only.
+            path.move(to: CGPoint(x: 0, y: h))
+            path.addLine(to: CGPoint(x: w, y: h))
+            path.addLine(to: CGPoint(x: w, y: r))
+            path.addArc(center: CGPoint(x: w - r, y: r), radius: r, startAngle: 0, endAngle: -.pi / 2, clockwise: true)
+            path.addLine(to: CGPoint(x: r, y: 0))
+            path.addArc(center: CGPoint(x: r, y: r), radius: r, startAngle: -.pi / 2, endAngle: .pi, clockwise: true)
+            path.closeSubpath()
+        }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         bg.path = path
         bg.frame = bounds

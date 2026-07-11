@@ -461,6 +461,12 @@ final class StatusController: NSObject, NSMenuDelegate {
     let notchContentPad: CGFloat = 12 // horizontal padding around the island's content row
     let notchExpandedWidth: CGFloat = 404 // width of the expanded (hover) dashboard panel (compact design)
     var notchCollapseWork: DispatchWorkItem? // pending collapse after the pointer leaves the island
+    // Frame-transition generation. Several triggers animate the island's frame independently (the
+    // 0.4s tick's resize, hover expand, hover-poll collapse, collapse-completion settle); starting
+    // any new transition bumps this, and every animation COMPLETION validates it before acting —
+    // a stale completion (e.g. expand's "pin the frame" landing after a collapse began) otherwise
+    // snaps the window to an outdated frame mid-flight, which reads as flicker.
+    var notchGen = 0
     var notchResting = true         // last render's idle flag; a synthetic (external) pill hides while resting
     // Expanded dashboard state.
     enum NotchPage { case dashboard, settings }
@@ -655,6 +661,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         let bareW = max(geo.notchRect.width, 1)
         let wasBare = cur.width <= bareW + 0.5
         let isBare = frame.width <= bareW + 0.5
+        notchGen += 1
+        let gen = notchGen
         if wasBare && !isBare {
             // Activating: the island expands OUT of the camera housing — width grows from the bare
             // notch to the final size, anchored on the notch center. Content fades in only after
@@ -665,7 +673,7 @@ final class StatusController: NSObject, NSMenuDelegate {
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 win.animator().setFrame(frame, display: true)
             }, completionHandler: { [weak self] in
-                guard let view = self?.notchView else { return }
+                guard let self = self, gen == self.notchGen, let view = self.notchView else { return }
                 NSAnimationContext.runAnimationGroup { ctx in
                     ctx.duration = 0.14
                     view.animateFlankAlpha(1)
@@ -678,7 +686,8 @@ final class StatusController: NSObject, NSMenuDelegate {
                 ctx.duration = 0.10
                 view.animateFlankAlpha(0)
             }, completionHandler: { [weak self] in
-                guard let self = self, let win = self.notchWindow, let geo = self.notchGeo,
+                guard let self = self, gen == self.notchGen,
+                      let win = self.notchWindow, let geo = self.notchGeo,
                       let view = self.notchView, !view.expanded else { return }
                 // Reactivated during the fade? Bail; the activation/glide branch owns the frame now.
                 guard view.desiredContentWidth() <= 0 else { view.setFlankAlpha(1); return }
@@ -687,7 +696,8 @@ final class StatusController: NSObject, NSMenuDelegate {
                     ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
                     win.animator().setFrame(self.collapsedFrame(geo, view), display: true)
                 }, completionHandler: { [weak self] in
-                    self?.notchView?.setFlankAlpha(1)   // fields are empty while idle; ready for next turn
+                    guard let self = self, gen == self.notchGen else { return }
+                    self.notchView?.setFlankAlpha(1)   // fields are empty while idle; ready for next turn
                 })
             })
         } else {
@@ -710,10 +720,21 @@ final class StatusController: NSObject, NSMenuDelegate {
     // toggling expand/collapse. Instead: expand on a genuine enter, then poll the real cursor position
     // and collapse only once it has truly left the current (large, when expanded) window frame. The big
     // expanded frame gives wide hysteresis, so edge jitter can't flip it.
+    // Hover containment with slop. NSRect.contains EXCLUDES the max edges, and the island's top
+    // edge IS the screen's top edge — a cursor thrown at the notch pins to y == maxY, which the
+    // strict test reads as "outside". That collapsed the drawer under a perfectly-parked pointer,
+    // a jitter re-entered, and the panel flickered open/closed in a loop. Pad generously above
+    // the top edge (the cursor can never really be up there) and a little around the sides.
+    private func notchHitFrame() -> NSRect? {
+        guard let win = notchWindow else { return nil }
+        return NSRect(x: win.frame.minX - 8, y: win.frame.minY - 4,
+                      width: win.frame.width + 16, height: win.frame.height + 60)
+    }
+
     func notchHoverEnter() {
-        guard let win = notchWindow, let view = notchView else { return }
-        guard win.frame.contains(NSEvent.mouseLocation) else { return }   // ignore stray enters
-        if !view.expanded { notchPage = .dashboard; expandNotch() }        // fresh open → dashboard
+        guard let view = notchView, let hit = notchHitFrame() else { return }
+        guard hit.contains(NSEvent.mouseLocation) else { return }   // ignore stray enters
+        if !view.expanded { notchPage = .dashboard; expandNotch() }  // fresh open → dashboard
         startNotchHoverPoll()
     }
     func notchHoverExit() { startNotchHoverPoll() }
@@ -725,8 +746,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
     }
     private func notchHoverPoll() {
-        guard let win = notchWindow, let view = notchView, view.expanded else { notchCollapseWork = nil; return }
-        if win.frame.contains(NSEvent.mouseLocation) {
+        guard let view = notchView, view.expanded, let hit = notchHitFrame() else { notchCollapseWork = nil; return }
+        if hit.contains(NSEvent.mouseLocation) {
             startNotchHoverPoll()          // still inside the panel → keep it open, keep watching
         } else {
             notchCollapseWork = nil
@@ -736,6 +757,13 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     func expandNotch(animated: Bool = true) {
         guard let geo = notchGeo, let win = notchWindow, let view = notchView else { return }
+        // Take ownership of the frame: invalidate in-flight transitions' completions (e.g. a tick
+        // activation glide that started a beat earlier) and clear any queued hover-poll collapse —
+        // the caller restarts the poll AFTER expansion, so it watches the expanded frame.
+        notchGen += 1
+        let gen = notchGen
+        notchCollapseWork?.cancel()
+        notchCollapseWork = nil
         let bodyH = populateNotchBody()
         view.setExpanded(true, bodyHeight: bodyH)
         let w = notchExpandedWidth
@@ -752,8 +780,9 @@ final class StatusController: NSObject, NSMenuDelegate {
             view.body.animator().alphaValue = 1   // content fades in as the panel drops
         }, completionHandler: { [weak self] in
             // Pin the exact target frame — the animator can settle a hair off after the overshoot,
-            // which would leave the wide content clipped by a slightly-narrow window.
-            guard let self = self, self.notchView?.expanded == true else { return }
+            // which would leave the wide content clipped by a slightly-narrow window. Stale-guard:
+            // if a collapse started meanwhile, pinning would snap the closing panel back open.
+            guard let self = self, gen == self.notchGen, self.notchView?.expanded == true else { return }
             win.setFrame(frame, display: true)
             notchDbg("expanded settled at \(win.frame), target=\(frame), bodyH=\(bodyH)")
         })
@@ -765,6 +794,8 @@ final class StatusController: NSObject, NSMenuDelegate {
         // Close straight into the REAL island frame — the bare camera housing when idle, the
         // flanked pill while working — not an oversized intermediate box (the old target was
         // band + notchDrop tall, which parked a visibly-too-big black shape after every close).
+        notchGen += 1
+        let gen = notchGen
         let frame = collapsedFrame(geo, view)
         view.setFlankAlpha(0)   // keep the collapsed row invisible until the shrink lands
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -773,7 +804,7 @@ final class StatusController: NSObject, NSMenuDelegate {
             win.animator().setFrame(frame, display: true)
             view.body.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, gen == self.notchGen else { return }
             // Tear down the rows only after the fade, so nothing pops out mid-collapse.
             self.notchView?.setExpanded(false, bodyHeight: 0)
             self.notchView?.body.subviews.forEach { $0.removeFromSuperview() }
@@ -788,6 +819,11 @@ final class StatusController: NSObject, NSMenuDelegate {
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.12
                 self.notchView?.animateFlankAlpha(1)
+            }
+            // Pointer came back while we were closing (mid-animation hovers can't re-expand because
+            // `expanded` is still true then) — honor it now instead of demanding a fresh enter event.
+            if let hit = self.notchHitFrame(), hit.contains(NSEvent.mouseLocation) {
+                self.notchHoverEnter()
             }
         })
         notchDbg("collapsed to \(frame)")
