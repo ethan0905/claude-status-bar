@@ -458,7 +458,6 @@ final class StatusController: NSObject, NSMenuDelegate {
         return s
     }()
     let notchDrop: CGFloat = 12     // expanded: gap between the notch and the dashboard body
-    let collapsedLip: CGFloat = 6   // collapsed: thin rounded lip below the menu-bar band (content flanks the notch, no big drop)
     let notchContentPad: CGFloat = 12 // horizontal padding around the island's content row
     let notchExpandedWidth: CGFloat = 404 // width of the expanded (hover) dashboard panel (compact design)
     var notchCollapseWork: DispatchWorkItem? // pending collapse after the pointer leaves the island
@@ -608,18 +607,15 @@ final class StatusController: NSObject, NSMenuDelegate {
         return NSScreen.screens.first { $0.frame.contains(p) } ?? NSScreen.main ?? NSScreen.screens.first!
     }
 
-    // Collapsed window frame: content flanks the notch in the menu-bar band (split design), so height
-    // is just the band + a thin lip — no big drop. Width = the two symmetric flanks + the notch, or the
-    // bare notch when idle. Centered on the notch.
+    // Collapsed window frame: content flanks the notch in the menu-bar band (split design). Height
+    // is ALWAYS exactly the camera housing's (the band) — idle and working alike — so the black
+    // never overhangs the physical notch; only the width changes (bare cutout when idle, two
+    // symmetric flanks + the notch while working). Centered on the notch.
     func collapsedFrame(_ geo: NotchGeometry, _ view: NotchContentView) -> NSRect {
         let band = geo.menuBarHeight > 0 ? geo.menuBarHeight : 30
         let dcw = view.desiredContentWidth()
-        // Idle (bare notch): match the physical cutout EXACTLY — same width, same height, no lip —
-        // so the resting island is indistinguishable from the camera housing. The lip only exists
-        // while there's flanking content to underline.
-        let panelH = dcw <= 0 ? band : band + collapsedLip
         let panelW = dcw <= 0 ? max(geo.notchRect.width, 1) : dcw + 2 * NotchContentView.sidePad
-        return NSRect(x: geo.centerX - panelW / 2, y: geo.topY - panelH, width: panelW, height: panelH)
+        return NSRect(x: geo.centerX - panelW / 2, y: geo.topY - band, width: panelW, height: band)
     }
 
     // Called every tick: if the cursor moved to a different display, move the island onto it,
